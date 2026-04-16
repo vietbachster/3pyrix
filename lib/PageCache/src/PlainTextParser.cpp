@@ -67,6 +67,11 @@ bool PlainTextParser::parsePages(const std::function<void(std::unique_ptr<Page>)
       startNewPage();
 
       if (maxPages > 0 && pagesCreated >= maxPages) {
+        // Add the line to the new page before stopping so it isn't lost.
+        // extractLine() already erased these words from pendingBlock_; if we
+        // discard the line here the content disappears at page transitions.
+        currentPage->elements.push_back(std::make_shared<PageLine>(line, 0, currentPageY));
+        currentPageY += lineHeight;
         return false;
       }
     }
