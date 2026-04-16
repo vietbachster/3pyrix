@@ -1572,6 +1572,9 @@ void ReaderState::commitPendingConfirmClick(Core& core) {
 }
 
 void ReaderState::toggleReadingOrientation(Core& core) {
+  // Stop background task before reading pageCache_ to avoid race condition.
+  stopBackgroundCaching();
+
   if (contentLoaded_) {
     pendingProgress_ = buildProgressSnapshot(core);
     pendingProgressRestore_ = pendingProgress_.hasTextAnchor();
@@ -1601,7 +1604,6 @@ void ReaderState::toggleReadingOrientation(Core& core) {
   renderer_.displayBuffer();
   core.display.markDirty();
 
-  stopBackgroundCaching();
   parser_.reset();
   parserSpineIndex_ = -1;
   pageCache_.reset();
