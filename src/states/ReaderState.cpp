@@ -35,10 +35,10 @@ namespace papyrix {
 
 static constexpr int kCacheTaskStackSize = 12288;
 static constexpr int kCacheTaskStopTimeoutMs = 10000;  // 10s - generous for slow SD operations
-static constexpr int kReaderMarginTop = 17;
-static constexpr int kReaderMarginRight = 15;
-static constexpr int kReaderMarginBottom = 16;
-static constexpr int kReaderMarginLeft = 15;
+static constexpr int kReaderMarginTop = 12;
+static constexpr int kReaderMarginRight = 12;
+static constexpr int kReaderMarginBottom = 6;
+static constexpr int kReaderMarginLeft = 12;
 static constexpr uint32_t kConfirmDoubleClickMs = 350;
 
 namespace {

@@ -33,7 +33,7 @@ struct RenderConfig {
 
   int getReadingLineHeight() const {
     const bool landscape = isLandscape();
-    return readerFontSize == 3 ? (landscape ? 55 : 54) : (landscape ? 45 : 42);
+    return readerFontSize == 3 ? (landscape ? 56 : 51) : (landscape ? 42 : 43);
   }
 
   bool operator==(const RenderConfig& o) const {
