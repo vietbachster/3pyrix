@@ -39,3 +39,8 @@
 
 # debug information files
 *.dwo
+__pycache__
+test/
+tools/
+.pio/
+.DS_Store
