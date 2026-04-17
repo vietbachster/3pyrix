@@ -150,8 +150,22 @@ int GfxRenderer::getTextWidth(const int fontId, const char* text, const EpdFontF
       }
     }
   } else {
-    int h = 0;
-    fontMap.at(fontId).getTextDimensions(text, &w, &h, style);
+    // Advance-based measurement: sum glyph->advanceX per character.
+    // This matches how drawText advances the cursor, avoiding the bounding-box
+    // underestimate that causes justified lines to overflow the right margin.
+    const auto& font = fontMap.at(fontId);
+    const char* ptr = text;
+    uint32_t cp;
+    while ((cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&ptr)))) {
+      if (utf8IsCombiningMark(cp)) continue;
+      const EpdGlyph* glyph = font.getGlyph(cp, style);
+      if (glyph) {
+        w += glyph->advanceX;
+      } else {
+        const EpdGlyph* fallback = font.getGlyph('?', style);
+        if (fallback) w += fallback->advanceX;
+      }
+    }
   }
 
   // Insert into flat hash table; clear if full
