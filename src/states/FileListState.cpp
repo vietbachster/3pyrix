@@ -390,7 +390,7 @@ void FileListState::render(Core& core) {
   } else {
     strcpy(title, "Files");
   }
-  renderer_.drawCenteredText(theme.uiFontId, 10, title, theme.primaryTextBlack);
+  renderer_.drawCenteredText(theme.uiFontId, 15, title, theme.primaryTextBlack);
 
   // Empty state
   if (files_.empty()) {
@@ -543,9 +543,8 @@ void FileListState::promptDelete(Core& core) {
 
 int FileListState::getPageItems() const {
   const Theme& theme = THEME_MANAGER.current();
-  const int listStartY =
-      ui::titleBottomY(renderer_, theme) + 6 + renderer_.getLineHeight(theme.smallFontId) + 10;
-  constexpr int bottomMargin = 70;
+  constexpr int listStartY = 60;
+  constexpr int bottomMargin = 60;
   const int availableHeight = renderer_.getScreenHeight() - listStartY - bottomMargin;
   const int itemHeight = theme.itemHeight + theme.itemSpacing;
   return std::max(1, availableHeight / itemHeight);
