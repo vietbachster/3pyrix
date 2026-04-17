@@ -143,6 +143,25 @@ void image(const GfxRenderer& r, int x, int y, const uint8_t* data, int w, int h
   }
 }
 
+void drawTextCenteredInRect(const GfxRenderer& r, const int fontId, const int x, const int y, const int width,
+                            const int height, const char* text, const bool black, const EpdFontFamily::Style style) {
+  if (text == nullptr || *text == '\0') {
+    return;
+  }
+
+  int minX = 0;
+  int minY = 0;
+  int maxX = 0;
+  int maxY = 0;
+  r.getTextBounds(fontId, text, &minX, &minY, &maxX, &maxY, style);
+
+  const int textWidth = maxX - minX;
+  const int textHeight = maxY - minY;
+  const int textX = x + (width - textWidth) / 2 - minX;
+  const int textY = y + (height - textHeight) / 2 - minY;
+  r.drawText(fontId, textX, textY, text, black, style);
+}
+
 void dialog(const GfxRenderer& r, const Theme& t, const char* titleText, const char* msg, int selected) {
   const int screenW = r.getScreenWidth();
   const int screenH = r.getScreenHeight();
@@ -167,19 +186,17 @@ void dialog(const GfxRenderer& r, const Theme& t, const char* titleText, const c
   const int btnW = 80;
   const int btnH = 30;
   const int btnY = dialogY + dialogH - 50;
-  const int btnTextY = btnY + (btnH - r.getLineHeight(t.uiFontId)) / 2;
   const int yesX = dialogX + (dialogW / 2) - btnW - 20;
   const int noX = dialogX + (dialogW / 2) + 20;
 
   // Yes button
   if (selected == 0) {
     r.fillRect(yesX, btnY, btnW, btnH, t.selectionFillBlack);
-    r.drawCenteredText(t.uiFontId, btnTextY, "Yes", t.selectionTextBlack);
   } else {
     r.drawRect(yesX, btnY, btnW, btnH, t.primaryTextBlack);
   }
-  r.drawText(t.uiFontId, yesX + (btnW - r.getTextWidth(t.uiFontId, "Yes")) / 2, btnTextY, "Yes",
-             selected == 0 ? t.selectionTextBlack : t.primaryTextBlack);
+  drawTextCenteredInRect(r, t.uiFontId, yesX, btnY, btnW, btnH, "Yes",
+                         selected == 0 ? t.selectionTextBlack : t.primaryTextBlack);
 
   // No button
   if (selected == 1) {
@@ -187,8 +204,8 @@ void dialog(const GfxRenderer& r, const Theme& t, const char* titleText, const c
   } else {
     r.drawRect(noX, btnY, btnW, btnH, t.primaryTextBlack);
   }
-  r.drawText(t.uiFontId, noX + (btnW - r.getTextWidth(t.uiFontId, "No")) / 2, btnTextY, "No",
-             selected == 1 ? t.selectionTextBlack : t.primaryTextBlack);
+  drawTextCenteredInRect(r, t.uiFontId, noX, btnY, btnW, btnH, "No",
+                         selected == 1 ? t.selectionTextBlack : t.primaryTextBlack);
 }
 
 // Keyboard layout - 10x10 grid

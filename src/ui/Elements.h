@@ -55,6 +55,10 @@ int textWrapped(const GfxRenderer& r, const Theme& t, int y, const char* str, in
 // Image - Bitmap display at position
 void image(const GfxRenderer& r, int x, int y, const uint8_t* data, int w, int h);
 
+// Draw text centered within a rectangle using the text's own glyph bounds
+void drawTextCenteredInRect(const GfxRenderer& r, int fontId, int x, int y, int width, int height, const char* text,
+                            bool black = true, EpdFontFamily::Style style = EpdFontFamily::REGULAR);
+
 // Dialog - Yes/No confirmation dialog
 void dialog(const GfxRenderer& r, const Theme& t, const char* title, const char* msg, int selected);
 
