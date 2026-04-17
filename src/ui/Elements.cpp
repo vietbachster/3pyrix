@@ -158,7 +158,9 @@ void drawTextCenteredInRect(const GfxRenderer& r, const int fontId, const int x,
   const int textWidth = maxX - minX;
   const int textHeight = maxY - minY;
   const int textX = x + (width - textWidth) / 2 - minX;
-  const int textY = y + (height - textHeight) / 2 - minY;
+  const int ascender = r.getFontAscenderSize(fontId);
+  const int screenTop = 2 * ascender - maxY;
+  const int textY = y + (height - textHeight) / 2 - screenTop;
   r.drawText(fontId, textX, textY, text, black, style);
 }
 
