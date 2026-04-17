@@ -271,6 +271,7 @@ bool earlyInit() {
 
   inputManager.begin();
   Wire.begin(I2C_SDA, I2C_SCL, 400000);
+  Wire.setTimeOut(4);
 
   // Initialize SPI and SD card before wakeup verification so settings are available
   SPI.begin(EPD_SCLK, SD_SPI_MISO, EPD_MOSI, EPD_CS);

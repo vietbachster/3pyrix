@@ -582,12 +582,12 @@ void SettingsState::populateSystemInfo() {
   infoView_.addField("Uptime", uptimeStr);
 
   // Battery
+  const uint16_t percentage = batteryMonitor.readPercentage();
   const uint16_t millivolts = batteryMonitor.readMillivolts();
   char batteryStr[24];
   if (millivolts < 3000 || millivolts > 4500) {
     snprintf(batteryStr, sizeof(batteryStr), "-- (%umV)", millivolts);
   } else {
-    const uint8_t percentage = BatteryMonitor::percentageFromMillivolts(millivolts);
     snprintf(batteryStr, sizeof(batteryStr), "%u%% (%umV)", percentage, millivolts);
   }
   infoView_.addField("Battery", batteryStr);
