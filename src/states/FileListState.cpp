@@ -390,7 +390,7 @@ void FileListState::render(Core& core) {
   } else {
     strcpy(title, "Files");
   }
-  renderer_.drawCenteredText(theme.uiFontId, 15, title, theme.primaryTextBlack);
+  renderer_.drawCenteredText(theme.uiFontId, theme.screenMarginTop, title, theme.primaryTextBlack);
 
   // Empty state
   if (files_.empty()) {
