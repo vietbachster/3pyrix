@@ -4,6 +4,7 @@
 #include <cstring>
 #include <string>
 
+#include "config.h"
 #include "core/PapyrixSettings.h"
 
 namespace ui {
@@ -370,7 +371,7 @@ char getKeyboardChar(const KeyboardState& state) {
 void battery(const GfxRenderer& r, const Theme& t, int x, int y, int percent) {
   char buf[8];
   snprintf(buf, sizeof(buf), "%d%%", percent);
-  r.drawText(t.smallFontId, x, y, buf, t.primaryTextBlack);
+  r.drawText(SMALL_FONT_ID, x, y, buf, t.primaryTextBlack);
 }
 
 void bookCard(const GfxRenderer& r, const Theme& t, int y, const char* titleText, const char* author,
