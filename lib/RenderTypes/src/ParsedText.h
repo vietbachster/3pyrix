@@ -20,6 +20,7 @@ using AbortCallback = std::function<bool()>;
 class ParsedText {
   std::vector<std::string> words;
   std::vector<EpdFontFamily::Style> wordStyles;
+  std::vector<bool> wordContinues;  // true = word attaches to previous (no space gap)
   TextBlock::BLOCK_STYLE style;
   uint8_t indentLevel;
   bool hyphenationEnabled;
@@ -52,7 +53,7 @@ class ParsedText {
         isRtl(rtl) {}
   ~ParsedText() = default;
 
-  void addWord(std::string word, EpdFontFamily::Style fontStyle);
+  void addWord(std::string word, EpdFontFamily::Style fontStyle, bool attachToPrevious = false);
   void setStyle(const TextBlock::BLOCK_STYLE style) { this->style = style; }
   void setRtl(const bool rtl) { isRtl = rtl; }
   void setUseGreedyBreaking(const bool greedy) { useGreedyBreaking = greedy; }

@@ -151,7 +151,7 @@ float calculateDemerits(float badness, bool isLastLine) {
 
 }  // namespace
 
-void ParsedText::addWord(std::string word, const EpdFontFamily::Style fontStyle) {
+void ParsedText::addWord(std::string word, const EpdFontFamily::Style fontStyle, const bool attachToPrevious) {
   if (word.empty()) return;
 
   // Check if word contains any CJK characters
@@ -169,12 +169,16 @@ void ParsedText::addWord(std::string word, const EpdFontFamily::Style fontStyle)
     // No CJK - keep as single word (Latin, accented Latin, Cyrillic, etc.)
     words.push_back(std::move(word));
     wordStyles.push_back(fontStyle);
+    // continues = true if caller marked it, or if it's pure attaching punctuation
+    wordContinues.push_back(attachToPrevious || isAttachingPunctuationWord(words.back()));
     return;
   }
 
-  // Mixed content: group non-CJK runs together, split CJK individually
+  // Mixed content: group non-CJK runs together, split CJK individually.
+  // Only the first sub-word inherits attachToPrevious; all others are independent.
   const unsigned char* p = reinterpret_cast<const unsigned char*>(word.c_str());
   std::string nonCjkBuf;
+  bool isFirstSubWord = true;
 
   while ((cp = utf8NextCodepoint(&p))) {
     if (isCjkCodepoint(cp)) {
@@ -182,6 +186,8 @@ void ParsedText::addWord(std::string word, const EpdFontFamily::Style fontStyle)
       if (!nonCjkBuf.empty()) {
         words.push_back(std::move(nonCjkBuf));
         wordStyles.push_back(fontStyle);
+        wordContinues.push_back(isFirstSubWord ? attachToPrevious : false);
+        isFirstSubWord = false;
         nonCjkBuf.clear();
       }
 
@@ -199,6 +205,8 @@ void ParsedText::addWord(std::string word, const EpdFontFamily::Style fontStyle)
       }
       words.push_back(buf);
       wordStyles.push_back(fontStyle);
+      wordContinues.push_back(isFirstSubWord ? attachToPrevious : false);
+      isFirstSubWord = false;
     } else {
       // Non-CJK character - accumulate into buffer
       if (cp < 0x80) {
@@ -223,6 +231,7 @@ void ParsedText::addWord(std::string word, const EpdFontFamily::Style fontStyle)
   if (!nonCjkBuf.empty()) {
     words.push_back(std::move(nonCjkBuf));
     wordStyles.push_back(fontStyle);
+    wordContinues.push_back(isFirstSubWord ? attachToPrevious : false);
   }
 }
 
@@ -248,6 +257,7 @@ bool ParsedText::layoutAndExtractLines(const GfxRenderer& renderer, const int fo
   {
     auto it = words.begin();
     auto sIt = wordStyles.begin();
+    auto cIt = wordContinues.begin();
     while (it != words.end()) {
       auto nextIt = std::next(it);
       if (nextIt != words.end() && hasTrailingSoftHyphen(*it)) {
@@ -255,10 +265,12 @@ bool ParsedText::layoutAndExtractLines(const GfxRenderer& renderer, const int fo
         *it += *nextIt;              // Rejoin with suffix
         words.erase(nextIt);
         wordStyles.erase(std::next(sIt));
+        wordContinues.erase(std::next(cIt));
         // Don't advance - check if rejoined word also has marker (nested splits)
       } else {
         ++it;
         ++sIt;
+        ++cIt;
       }
     }
   }
@@ -370,6 +382,11 @@ std::vector<size_t> ParsedText::computeLineBreaks(const int pageWidth, const int
         break;
       }
 
+      // Don't allow a break after j if the next word continues (attaches without space gap)
+      if (j + 1 < n && wordContinues[j + 1]) {
+        continue;
+      }
+
       bool isLastLine = (j == n - 1);
       float badness = calculateBadness(lineWidth, pageWidth);
       float demerits = calculateDemerits(badness, isLastLine) + LINE_PENALTY;
@@ -425,8 +442,10 @@ std::vector<size_t> ParsedText::computeLineBreaksGreedy(const GfxRenderer& rende
 
     const int wordWidth = wordWidths[i];
 
-    // Check if adding this word would overflow the line
-    if (lineWidth + wordWidth + spaceWidth > pageWidth && lineWidth > 0) {
+    // Check if adding this word would overflow the line.
+    // Continuation words (attaching punctuation etc.) are never allowed to start a new
+    // line — force them onto the current line even if it causes a slight overflow.
+    if (lineWidth + wordWidth + spaceWidth > pageWidth && lineWidth > 0 && !wordContinues[i]) {
       // Try to hyphenate: split the overflowing word so its first part fits on this line
       const int remainingWidth = pageWidth - lineWidth - spaceWidth;
       if (remainingWidth > 0 &&
@@ -464,29 +483,33 @@ void ParsedText::extractLine(const size_t breakIndex, const int pageWidth, const
   const size_t lineWordCount = lineBreak - lastBreakAt;
 
   // Calculate total word width for this line and count actual word gaps
-  // (punctuation that attaches to previous word doesn't count as a gap)
+  // (continuation words that attach to previous don't count as a gap)
   int lineWordWidthSum = 0;
   size_t actualGapCount = 0;
-  auto countWordIt = words.begin();
+  auto countContinuesIt = wordContinues.begin();
 
   for (size_t wordIdx = 0; wordIdx < lineWordCount; wordIdx++) {
     lineWordWidthSum += wordWidths[lastBreakAt + wordIdx];
-    // Count gaps: each word after the first creates a gap, unless it's attaching punctuation
-    if (wordIdx > 0 && !isAttachingPunctuationWord(*countWordIt)) {
+    // Count gaps: each word after the first creates a gap, unless it continues the previous
+    if (wordIdx > 0 && !(*countContinuesIt)) {
       actualGapCount++;
     }
-    ++countWordIt;
+    ++countContinuesIt;
   }
 
   // Calculate spacing
   const int spareSpace = pageWidth - lineWordWidthSum;
 
   int spacing = spaceWidth;
+  int spacingRemainder = 0;
   const bool isLastLine = breakIndex == lineBreakIndices.size() - 1;
 
-  // For justified text, calculate spacing based on actual gap count
+  // For justified text, distribute spare space evenly across gaps.
+  // The integer remainder (spareSpace % gapCount) is spread one pixel at a time
+  // to the first N gaps so the line fills exactly pageWidth.
   if (style == TextBlock::JUSTIFIED && !isLastLine && actualGapCount >= 1) {
     spacing = spareSpace / static_cast<int>(actualGapCount);
+    spacingRemainder = spareSpace % static_cast<int>(actualGapCount);
   }
 
   // For RTL text, default to right alignment
@@ -499,6 +522,7 @@ void ParsedText::extractLine(const size_t breakIndex, const int pageWidth, const
 
   auto wordIt = words.begin();
   auto styleIt = wordStyles.begin();
+  auto continuesIt = wordContinues.begin();
 
   if (isRtl) {
     // RTL: Position words from right to left
@@ -514,12 +538,13 @@ void ParsedText::extractLine(const size_t breakIndex, const int pageWidth, const
       xpos -= currentWordWidth;
       lineData.push_back({replaceTrailingSoftHyphen(std::move(*wordIt)), xpos, *styleIt});
 
-      auto nextWordIt = wordIt;
-      ++nextWordIt;
-      const bool nextIsAttachingPunctuation = wordIdx + 1 < lineWordCount && isAttachingPunctuationWord(*nextWordIt);
-      xpos -= (nextIsAttachingPunctuation ? 0 : spacing);
+      auto nextContinuesIt = continuesIt;
+      ++nextContinuesIt;
+      const bool nextContinues = wordIdx + 1 < lineWordCount && *nextContinuesIt;
+      xpos -= (nextContinues ? 0 : spacing);
       ++wordIt;
       ++styleIt;
+      ++continuesIt;
     }
   } else {
     // LTR: Position words from left to right
@@ -530,22 +555,33 @@ void ParsedText::extractLine(const size_t breakIndex, const int pageWidth, const
       xpos = (spareSpace - static_cast<int>(actualGapCount) * spaceWidth) / 2;
     }
 
+    int gapsEmitted = 0;
     for (size_t wordIdx = 0; wordIdx < lineWordCount; wordIdx++) {
       const uint16_t currentWordWidth = wordWidths[lastBreakAt + wordIdx];
       lineData.push_back({replaceTrailingSoftHyphen(std::move(*wordIt)), xpos, *styleIt});
 
-      auto nextWordIt = wordIt;
-      ++nextWordIt;
-      const bool nextIsAttachingPunctuation = wordIdx + 1 < lineWordCount && isAttachingPunctuationWord(*nextWordIt);
-      xpos += currentWordWidth + (nextIsAttachingPunctuation ? 0 : spacing);
+      auto nextContinuesIt = continuesIt;
+      ++nextContinuesIt;
+      const bool nextContinues = wordIdx + 1 < lineWordCount && *nextContinuesIt;
+      if (!nextContinues) {
+        // Distribute remainder pixels one-by-one to the first N gaps so the
+        // line fills exactly pageWidth for justified text.
+        const int gap = spacing + (gapsEmitted < spacingRemainder ? 1 : 0);
+        xpos += currentWordWidth + gap;
+        gapsEmitted++;
+      } else {
+        xpos += currentWordWidth;
+      }
       ++wordIt;
       ++styleIt;
+      ++continuesIt;
     }
   }
 
-  // Remove consumed elements from lists
+  // Remove consumed elements from all three parallel lists
   words.erase(words.begin(), wordIt);
   wordStyles.erase(wordStyles.begin(), styleIt);
+  wordContinues.erase(wordContinues.begin(), continuesIt);
 
   processLine(std::make_shared<TextBlock>(std::move(lineData), effectiveStyle));
 }
@@ -554,9 +590,11 @@ bool ParsedText::preSplitOversizedWords(const GfxRenderer& renderer, const int f
                                         const AbortCallback& shouldAbort) {
   std::vector<std::string> newWords;
   std::vector<EpdFontFamily::Style> newStyles;
+  std::vector<bool> newContinues;
 
   auto wordIt = words.begin();
   auto styleIt = wordStyles.begin();
+  auto continuesIt = wordContinues.begin();
   size_t wordCount = 0;
 
   while (wordIt != words.end()) {
@@ -567,6 +605,7 @@ bool ParsedText::preSplitOversizedWords(const GfxRenderer& renderer, const int f
 
     const std::string& word = *wordIt;
     const EpdFontFamily::Style wordStyle = *styleIt;
+    const bool originalContinues = *continuesIt;
 
     // Measure word without soft hyphens
     const std::string stripped = stripSoftHyphens(word);
@@ -576,8 +615,18 @@ bool ParsedText::preSplitOversizedWords(const GfxRenderer& renderer, const int f
       // Word fits, keep as-is (will be stripped later in calculateWordWidths)
       newWords.push_back(word);
       newStyles.push_back(wordStyle);
+      newContinues.push_back(originalContinues);
     } else {
-      // Word is too wide - try to split at soft hyphen positions
+      // Word is too wide - try to split at soft hyphen positions.
+      // First piece inherits originalContinues; subsequent pieces get false.
+      bool isFirstPiece = true;
+      auto pushPiece = [&](std::string piece) {
+        newWords.push_back(std::move(piece));
+        newStyles.push_back(wordStyle);
+        newContinues.push_back(isFirstPiece ? originalContinues : false);
+        isFirstPiece = false;
+      };
+
       auto shyPositions = findSoftHyphenPositions(word);
 
       if (shyPositions.empty()) {
@@ -587,8 +636,7 @@ bool ParsedText::preSplitOversizedWords(const GfxRenderer& renderer, const int f
         auto breaks = Hyphenation::breakOffsets(word, true);
 
         if (breaks.empty()) {
-          newWords.push_back(word);
-          newStyles.push_back(wordStyle);
+          pushPiece(word);
         } else {
           size_t prevOffset = 0;
 
@@ -597,8 +645,7 @@ bool ParsedText::preSplitOversizedWords(const GfxRenderer& renderer, const int f
             const int remainingWidth = renderer.getTextWidth(fontId, remaining.c_str(), wordStyle);
 
             if (remainingWidth <= pageWidth) {
-              newWords.push_back(remaining);
-              newStyles.push_back(wordStyle);
+              pushPiece(remaining);
               break;
             }
 
@@ -620,13 +667,11 @@ bool ParsedText::preSplitOversizedWords(const GfxRenderer& renderer, const int f
             }
 
             if (bestIdx < 0) {
-              newWords.push_back(remaining);
-              newStyles.push_back(wordStyle);
+              pushPiece(remaining);
               break;
             }
 
-            newWords.push_back(std::move(bestPrefix));
-            newStyles.push_back(wordStyle);
+            pushPiece(std::move(bestPrefix));
             prevOffset = breaks[bestIdx].byteOffset;
           }
         }
@@ -644,18 +689,14 @@ bool ParsedText::preSplitOversizedWords(const GfxRenderer& renderer, const int f
           const int remainingWidth = renderer.getTextWidth(fontId, strippedRemaining.c_str(), wordStyle);
 
           if (remainingWidth <= pageWidth) {
-            // Remaining part fits, add it and done
-            newWords.push_back(remaining);
-            newStyles.push_back(wordStyle);
+            pushPiece(remaining);
             break;
           }
 
           // Find soft hyphen positions in remaining string
           auto localPositions = findSoftHyphenPositions(remaining);
           if (localPositions.empty()) {
-            // No more soft hyphens, output as-is
-            newWords.push_back(remaining);
-            newStyles.push_back(wordStyle);
+            pushPiece(remaining);
             break;
           }
 
@@ -671,9 +712,7 @@ bool ParsedText::preSplitOversizedWords(const GfxRenderer& renderer, const int f
           }
 
           if (bestPos < 0) {
-            // Even the smallest prefix is too wide - output as-is
-            newWords.push_back(remaining);
-            newStyles.push_back(wordStyle);
+            pushPiece(remaining);
             break;
           }
 
@@ -681,8 +720,7 @@ bool ParsedText::preSplitOversizedWords(const GfxRenderer& renderer, const int f
           std::string prefix = getWordPrefix(remaining, localPositions[bestPos]);
           std::string suffix = getWordSuffix(remaining, localPositions[bestPos]);
 
-          newWords.push_back(prefix);  // Already includes visible hyphen "-"
-          newStyles.push_back(wordStyle);
+          pushPiece(std::move(prefix));  // Already includes visible hyphen "-"
 
           if (suffix.empty()) {
             break;
@@ -694,10 +732,12 @@ bool ParsedText::preSplitOversizedWords(const GfxRenderer& renderer, const int f
 
     ++wordIt;
     ++styleIt;
+    ++continuesIt;
   }
 
   words = std::move(newWords);
   wordStyles = std::move(newStyles);
+  wordContinues = std::move(newContinues);
   return true;
 }
 
@@ -732,6 +772,8 @@ bool ParsedText::trySplitWordForLineEnd(const GfxRenderer& renderer, const int f
       auto nextStyleIt = std::next(styleIt);
       words.insert(nextWordIt, std::move(suffix));
       wordStyles.insert(nextStyleIt, fontStyle);
+      // Suffix starts a new line — not a continuation of anything
+      wordContinues.insert(wordContinues.begin() + wordIndex + 1, false);
 
       // Update widths vector
       wordWidths[wordIndex] = static_cast<uint16_t>(prefixWidth);

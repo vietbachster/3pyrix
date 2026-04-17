@@ -97,7 +97,7 @@ void ChapterHtmlSlimParser::startNewTextBlock(const TextBlock::BLOCK_STYLE style
       return;
     }
   }
-  currentTextBlock.reset(new ParsedText(style, config.indentLevel, config.hyphenation, true, pendingRtl_));
+  currentTextBlock.reset(new ParsedText(style, config.indentLevel, config.hyphenation, config.hyphenation, pendingRtl_));
 }
 
 void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char* name, const XML_Char** atts) {
@@ -793,7 +793,7 @@ bool ChapterHtmlSlimParser::resumeParsing() {
   if (pendingNewTextBlock_) {
     pendingNewTextBlock_ = false;
     currentTextBlock.reset(
-        new ParsedText(pendingBlockStyle_, config.indentLevel, config.hyphenation, true, pendingRtl_));
+        new ParsedText(pendingBlockStyle_, config.indentLevel, config.hyphenation, config.hyphenation, pendingRtl_));
     if (pendingListMarker_[0] != '\0') {
       currentTextBlock->addWord(pendingListMarker_, EpdFontFamily::REGULAR);
       pendingListMarker_[0] = '\0';
