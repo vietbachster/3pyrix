@@ -303,6 +303,7 @@ bool earlyInit() {
     LOG_ERR(TAG, "LittleFS mount failed, attempting format");
     if (!LittleFS.format() || !LittleFS.begin(false)) {
       LOG_ERR(TAG, "LittleFS recovery failed");
+      setupDisplayAndFonts();
       showErrorScreen("Internal storage error");
       return false;
     }

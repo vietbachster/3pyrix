@@ -79,16 +79,29 @@ XtcPageRenderer::RenderResult XtcPageRenderer::render(xtc::XtcParser& parser, ui
   // Load page data
   size_t bytesRead = 0;
   if (bitDepth == 2) {
+    bool streamOverflow = false;
+
     // Use streaming to load into separate buffers
     xtc::XtcError err = parser.loadPageStreaming(
         pageNum,
         [&](const uint8_t* data, size_t size, size_t offset) {
+          if (streamOverflow) {
+            return;
+          }
+
           // Direct data to the appropriate buffer based on offset
           size_t remaining = size;
           size_t srcOffset = 0;
 
           while (remaining > 0) {
             size_t currentOffset = offset + srcOffset;
+            if (currentOffset >= bufferSize) {
+              LOG_ERR(TAG, "Streaming page data exceeds expected buffer size (%zu >= %zu)", currentOffset,
+                      bufferSize);
+              streamOverflow = true;
+              break;
+            }
+
             if (currentOffset < planeSize) {
               // Writing to plane1
               size_t toWrite = std::min(remaining, planeSize - currentOffset);
@@ -98,17 +111,19 @@ XtcPageRenderer::RenderResult XtcPageRenderer::render(xtc::XtcParser& parser, ui
             } else {
               // Writing to plane2
               size_t plane2Offset = currentOffset - planeSize;
-              size_t toWrite = std::min(remaining, planeSize - plane2Offset);
+              size_t toWrite = std::min(remaining, bufferSize - currentOffset);
               memcpy(plane2Buffer + plane2Offset, data + srcOffset, toWrite);
               srcOffset += toWrite;
               remaining -= toWrite;
             }
           }
-          bytesRead += size;
+          if (!streamOverflow) {
+            bytesRead += size;
+          }
         },
         4096);
 
-    if (err != xtc::XtcError::OK) {
+    if (err != xtc::XtcError::OK || streamOverflow || bytesRead != bufferSize) {
       LOG_ERR(TAG, "Failed to load page %u (streaming error)", pageNum);
       free(plane1Buffer);
       free(plane2Buffer);

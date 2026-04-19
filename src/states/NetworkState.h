@@ -34,6 +34,14 @@ class NetworkState : public State {
   StateId id() const override { return StateId::Network; }
 
  private:
+  enum class ConnectionAttempt : uint8_t {
+    None,
+    Hotspot,
+    OpenNetwork,
+    SavedCredential,
+    ManualPassword,
+  };
+
   GfxRenderer& renderer_;
   NetworkScreen currentScreen_;
   bool needsRender_;
@@ -53,6 +61,7 @@ class NetworkState : public State {
   // State tracking
   char selectedSSID_[33];
   bool passwordJustEntered_;
+  ConnectionAttempt lastConnectionAttempt_ = ConnectionAttempt::None;
   uint8_t scanRetryCount_ = 0;
   uint32_t scanRetryAt_ = 0;
   static constexpr uint8_t MAX_SCAN_RETRIES = 2;

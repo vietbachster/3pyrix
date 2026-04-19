@@ -47,6 +47,7 @@ void NetworkState::enter(Core& core) {
   needsRender_ = true;
   goBack_ = false;
   passwordJustEntered_ = false;
+  lastConnectionAttempt_ = ConnectionAttempt::None;
   scanRetryCount_ = 0;
   scanRetryAt_ = 0;
   selectedSSID_[0] = '\0';
@@ -269,6 +270,7 @@ void NetworkState::handleWifiList(Core& core, Button button) {
         const auto* cred = WIFI_STORE.findCredential(selectedSSID_);
         if (cred) {
           passwordJustEntered_ = false;
+          lastConnectionAttempt_ = ConnectionAttempt::SavedCredential;
           connectToNetwork(core, cred->ssid, cred->password);
         } else if (wifiListView_.networks[wifiListView_.selected].secured) {
           keyboardView_.setTitle("Enter Password");
@@ -279,6 +281,7 @@ void NetworkState::handleWifiList(Core& core, Button button) {
           needsRender_ = true;
         } else {
           passwordJustEntered_ = false;
+          lastConnectionAttempt_ = ConnectionAttempt::OpenNetwork;
           connectToNetwork(core, selectedSSID_, "");
         }
       }
@@ -334,6 +337,7 @@ void NetworkState::handlePasswordEntry(Core& core, Button button) {
       if (keyboardView_.confirmKey()) {
         // Input confirmed - try to connect
         passwordJustEntered_ = true;
+        lastConnectionAttempt_ = ConnectionAttempt::ManualPassword;
         connectToNetwork(core, selectedSSID_, keyboardView_.input);
       }
       needsRender_ = true;
@@ -357,8 +361,28 @@ void NetworkState::handleConnecting(Core& core, Button button) {
     if (connectingView_.buttons.isActive(0)) {
       if (connectingView_.status == ui::WifiConnectingView::Status::Failed ||
           connectingView_.status == ui::WifiConnectingView::Status::Connected) {
-        currentScreen_ = NetworkScreen::WifiList;
-        wifiListView_.needsRender = true;
+        switch (lastConnectionAttempt_) {
+          case ConnectionAttempt::Hotspot:
+            currentScreen_ = NetworkScreen::ModeSelect;
+            break;
+          case ConnectionAttempt::ManualPassword:
+            currentScreen_ = NetworkScreen::PasswordEntry;
+            break;
+          case ConnectionAttempt::OpenNetwork:
+          case ConnectionAttempt::SavedCredential:
+          case ConnectionAttempt::None:
+          default:
+            currentScreen_ = NetworkScreen::WifiList;
+            break;
+        }
+
+        if (currentScreen_ == NetworkScreen::ModeSelect) {
+          modeView_.needsRender = true;
+        } else if (currentScreen_ == NetworkScreen::PasswordEntry) {
+          keyboardView_.needsRender = true;
+        } else {
+          wifiListView_.needsRender = true;
+        }
         needsRender_ = true;
       }
     }
@@ -396,10 +420,33 @@ void NetworkState::handleConnecting(Core& core, Button button) {
           startWebServer(core);
         }
       } else if (connectingView_.status == ui::WifiConnectingView::Status::Failed) {
-        keyboardView_.clear();
-        keyboardView_.needsRender = true;
-        currentScreen_ = NetworkScreen::PasswordEntry;
-        needsRender_ = true;
+        switch (lastConnectionAttempt_) {
+          case ConnectionAttempt::Hotspot:
+            startHotspot(core);
+            break;
+          case ConnectionAttempt::ManualPassword:
+            connectToNetwork(core, selectedSSID_, keyboardView_.input);
+            break;
+          case ConnectionAttempt::OpenNetwork:
+            connectToNetwork(core, selectedSSID_, "");
+            break;
+          case ConnectionAttempt::SavedCredential: {
+            const auto* cred = WIFI_STORE.findCredential(selectedSSID_);
+            if (cred) {
+              connectToNetwork(core, cred->ssid, cred->password);
+            } else {
+              currentScreen_ = NetworkScreen::WifiList;
+              wifiListView_.needsRender = true;
+              needsRender_ = true;
+            }
+            break;
+          }
+          case ConnectionAttempt::None:
+            currentScreen_ = NetworkScreen::WifiList;
+            wifiListView_.needsRender = true;
+            needsRender_ = true;
+            break;
+        }
       }
     }
   }
@@ -506,6 +553,7 @@ void NetworkState::connectToNetwork(Core& core, const char* ssid, const char* pa
 
 void NetworkState::startHotspot(Core& core) {
   LOG_INF(TAG, "Starting hotspot");
+  lastConnectionAttempt_ = ConnectionAttempt::Hotspot;
 
   // Show connecting message
   connectingView_.setSsid(AP_SSID);

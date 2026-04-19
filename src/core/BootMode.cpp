@@ -43,6 +43,14 @@ BootMode detectBootMode() {
 
     cachedSleepResumeTransition = rtcSleepResumeTransition;
     sleepResumeCached = true;
+
+    // Reader sleep writes a one-shot pending reader transition to settings so
+    // early boot can skip wake verification before RTC state is inspected.
+    // Once RTC resume data has been consumed, clear the persistent flag to
+    // avoid reopening the last book on a later unrelated reset.
+    if (core.settings.pendingTransition != 0) {
+      clearTransition();
+    }
     clearSleepResumeTransition();
 
     return BootMode::READER;

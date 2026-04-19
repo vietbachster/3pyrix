@@ -6,6 +6,7 @@
 
 #include <cstring>
 
+#include "../core/BootMode.h"
 #include "../core/Core.h"
 #include "ThemeManager.h"
 
@@ -45,7 +46,16 @@ StateTransition ErrorState::update(Core& core) {
   Event e;
   while (core.events.pop(e)) {
     if (e.type == EventType::ButtonPress) {
-      // Any button press goes back to file list
+      const auto& transition = getTransition();
+      if (transition.isValid() && transition.mode == BootMode::READER) {
+        showTransitionNotification("Returning to library...");
+        saveTransition(BootMode::UI, nullptr, ReturnTo::FILE_MANAGER);
+        vTaskDelay(50 / portTICK_PERIOD_MS);
+        ESP.restart();
+        return StateTransition::stay(StateId::Error);
+      }
+
+      // In UI mode, any button press goes back to file list.
       return StateTransition::to(StateId::FileList);
     }
   }
