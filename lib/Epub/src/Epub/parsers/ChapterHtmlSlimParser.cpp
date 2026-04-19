@@ -38,7 +38,42 @@ constexpr int NUM_IMAGE_TAGS = sizeof(IMAGE_TAGS) / sizeof(IMAGE_TAGS[0]);
 const char* SKIP_TAGS[] = {"head"};
 constexpr int NUM_SKIP_TAGS = sizeof(SKIP_TAGS) / sizeof(SKIP_TAGS[0]);
 
-bool isWhitespace(const char c) { return c == ' ' || c == '\r' || c == '\n' || c == '\t'; }
+namespace {
+
+int utf8CodepointLen(const unsigned char c) {
+  if (c < 0x80) return 1;
+  if ((c >> 5) == 0x6) return 2;
+  if ((c >> 4) == 0xE) return 3;
+  if ((c >> 3) == 0x1E) return 4;
+  return 1;
+}
+
+size_t utf8CompletePrefixLength(const char* data, const size_t len) {
+  if (len == 0) return 0;
+
+  size_t continuationBytes = 0;
+  size_t i = len;
+  while (i > 0 && continuationBytes < 3 &&
+         (static_cast<unsigned char>(data[i - 1]) & 0xC0) == 0x80) {
+    --i;
+    ++continuationBytes;
+  }
+
+  if (i == 0) return len;
+
+  const int expectedBytes = utf8CodepointLen(static_cast<unsigned char>(data[i - 1]));
+  const size_t actualBytes = continuationBytes + 1;
+  if (expectedBytes > static_cast<int>(actualBytes)) {
+    return i - 1;
+  }
+  return len;
+}
+
+bool isBreakWhitespaceCodepoint(const uint32_t cp) {
+  return cp == ' ' || cp == '\r' || cp == '\n' || cp == '\t' || cp == 0x00A0 || cp == 0x2002 || cp == 0x2003;
+}
+
+}  // namespace
 
 // given the start and end of a tag, check to see if it matches a known tag
 bool matches(const char* tag_name, const char* possible_tags[], const int possible_tag_count) {
@@ -397,8 +432,25 @@ void XMLCALL ChapterHtmlSlimParser::characterData(void* userData, const XML_Char
   const XML_Char FEFF_BYTE_2 = static_cast<XML_Char>(0xBB);
   const XML_Char FEFF_BYTE_3 = static_cast<XML_Char>(0xBF);
 
-  for (int i = 0; i < len; i++) {
-    if (isWhitespace(s[i])) {
+  std::string data(self->pendingUtf8Bytes_, self->pendingUtf8ByteCount_);
+  data.append(s, len);
+  const size_t processLen = utf8CompletePrefixLength(data.data(), data.size());
+
+  self->pendingUtf8ByteCount_ = static_cast<uint8_t>(data.size() - processLen);
+  if (self->pendingUtf8ByteCount_ > 0) {
+    memcpy(self->pendingUtf8Bytes_, data.data() + processLen, self->pendingUtf8ByteCount_);
+  }
+
+  std::string processChunk = data.substr(0, processLen);
+  processChunk.push_back('\0');
+
+  const char* ptr = processChunk.c_str();
+  while (*ptr) {
+    const char* cpStart = ptr;
+    const uint32_t cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&ptr));
+    const int cpBytes = static_cast<int>(ptr - cpStart);
+
+    if (isBreakWhitespaceCodepoint(cp)) {
       // Currently looking at whitespace, if there's anything in the partWordBuffer, flush it
       if (self->partWordBufferIndex > 0) {
         self->flushPartWordBuffer();
@@ -408,13 +460,8 @@ void XMLCALL ChapterHtmlSlimParser::characterData(void* userData, const XML_Char
     }
 
     // Skip BOM character (sometimes appears before em-dashes in EPUBs)
-    if (s[i] == FEFF_BYTE_1) {
-      // Check if the next two bytes complete the 3-byte sequence
-      if ((i + 2 < len) && (s[i + 1] == FEFF_BYTE_2) && (s[i + 2] == FEFF_BYTE_3)) {
-        // Sequence 0xEF 0xBB 0xBF found!
-        i += 2;    // Skip the next two bytes
-        continue;  // Move to the next iteration
-      }
+    if (cpBytes == 3 && cpStart[0] == FEFF_BYTE_1 && cpStart[1] == FEFF_BYTE_2 && cpStart[2] == FEFF_BYTE_3) {
+      continue;
     }
 
     // If we're about to run out of space, then cut the word off and start a new one
@@ -445,7 +492,16 @@ void XMLCALL ChapterHtmlSlimParser::characterData(void* userData, const XML_Char
       }
     }
 
-    self->partWordBuffer[self->partWordBufferIndex++] = s[i];
+    if (self->partWordBufferIndex + cpBytes > MAX_WORD_SIZE) {
+      self->flushPartWordBuffer();
+    }
+
+    if (self->partWordBufferIndex + cpBytes > MAX_WORD_SIZE) {
+      continue;
+    }
+
+    memcpy(&self->partWordBuffer[self->partWordBufferIndex], cpStart, cpBytes);
+    self->partWordBufferIndex += cpBytes;
   }
 
   // Flag for deferred split - handled outside XML callback to avoid stack overflow

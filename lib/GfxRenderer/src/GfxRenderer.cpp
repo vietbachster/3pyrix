@@ -23,6 +23,22 @@ bool isCjkCodepoint(const uint32_t cp) {
   return false;
 }
 
+bool isSpecialSpacingCodepoint(const uint32_t cp) { return cp == 0x2002 || cp == 0x2003 || cp == 0x00A0; }
+
+int getSpecialWhitespaceAdvance(const EpdFontFamily& fontFamily, const uint32_t cp,
+                                const EpdFontFamily::Style style) {
+  if (!isSpecialSpacingCodepoint(cp)) return 0;
+
+  const EpdGlyph* spaceGlyph = fontFamily.getGlyph(' ', style);
+  if (!spaceGlyph) return 0;
+
+  int advance = spaceGlyph->advanceX;
+  if (cp == 0x2003) {
+    advance += spaceGlyph->advanceX;
+  }
+  return advance;
+}
+
 }  // namespace
 
 void GfxRenderer::insertFont(const int fontId, EpdFontFamily font) { fontMap.insert({fontId, font}); }
@@ -134,6 +150,8 @@ int GfxRenderer::getTextWidth(const int fontId, const char* text, const EpdFontF
     const char* ptr = text;
     uint32_t cp;
     while ((cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&ptr)))) {
+      if (utf8IsCombiningMark(cp)) continue;
+
       const int extWidth = getExternalGlyphWidth(cp);
       if (extWidth > 0) {
         w += extWidth;
@@ -142,9 +160,14 @@ int GfxRenderer::getTextWidth(const int fontId, const char* text, const EpdFontF
         if (glyph) {
           w += glyph->advanceX;
         } else {
-          const EpdGlyph* fallback = font.getGlyph('?', style);
-          if (fallback) {
-            w += fallback->advanceX;
+          const int whitespaceAdvance = getSpecialWhitespaceAdvance(font, cp, style);
+          if (whitespaceAdvance > 0) {
+            w += whitespaceAdvance;
+          } else {
+            const EpdGlyph* fallback = font.getGlyph('?', style);
+            if (fallback) {
+              w += fallback->advanceX;
+            }
           }
         }
       }
@@ -162,8 +185,13 @@ int GfxRenderer::getTextWidth(const int fontId, const char* text, const EpdFontF
       if (glyph) {
         w += glyph->advanceX;
       } else {
-        const EpdGlyph* fallback = font.getGlyph('?', style);
-        if (fallback) w += fallback->advanceX;
+        const int whitespaceAdvance = getSpecialWhitespaceAdvance(font, cp, style);
+        if (whitespaceAdvance > 0) {
+          w += whitespaceAdvance;
+        } else {
+          const EpdGlyph* fallback = font.getGlyph('?', style);
+          if (fallback) w += fallback->advanceX;
+        }
       }
     }
   }
@@ -229,6 +257,13 @@ void GfxRenderer::getTextBounds(const int fontId, const char* text, int* minX, i
   while ((cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&ptr)))) {
     const EpdGlyph* glyph = font.getGlyph(cp, style);
     if (!glyph) {
+      const int whitespaceAdvance = getSpecialWhitespaceAdvance(font, cp, style);
+      if (whitespaceAdvance > 0) {
+        lastBaseX = cursorX;
+        lastBaseAdvance = whitespaceAdvance;
+        cursorX += whitespaceAdvance;
+        continue;
+      }
       glyph = font.getGlyph('?', style);
     }
     if (!glyph) {
@@ -1047,14 +1082,10 @@ void GfxRenderer::renderChar(const EpdFontFamily& fontFamily, const uint32_t cp,
 
   const EpdGlyph* glyph = fontFamily.getGlyph(cp, style);
   if (!glyph) {
-    // For whitespace characters missing from font, advance by space width instead of rendering '?'
-    if (cp == 0x2002 || cp == 0x2003 || cp == 0x00A0) {  // EN SPACE, EM SPACE, NBSP
-      const EpdGlyph* spaceGlyph = fontFamily.getGlyph(' ', style);
-      if (spaceGlyph) {
-        *x += spaceGlyph->advanceX;
-        if (cp == 0x2003) *x += spaceGlyph->advanceX;  // EM SPACE = 2x width
-        return;
-      }
+    const int whitespaceAdvance = getSpecialWhitespaceAdvance(fontFamily, cp, style);
+    if (whitespaceAdvance > 0) {
+      *x += whitespaceAdvance;
+      return;
     }
     glyph = fontFamily.getGlyph('?', style);
   }

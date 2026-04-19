@@ -14,7 +14,38 @@
 namespace {
 constexpr size_t READ_CHUNK_SIZE = 4096;
 
-bool isWhitespace(char c) { return c == ' ' || c == '\r' || c == '\n' || c == '\t'; }
+int utf8CodepointLen(const unsigned char c) {
+  if (c < 0x80) return 1;
+  if ((c >> 5) == 0x6) return 2;
+  if ((c >> 4) == 0xE) return 3;
+  if ((c >> 3) == 0x1E) return 4;
+  return 1;
+}
+
+size_t utf8CompletePrefixLength(const char* data, const size_t len) {
+  if (len == 0) return 0;
+
+  size_t continuationBytes = 0;
+  size_t i = len;
+  while (i > 0 && continuationBytes < 3 &&
+         (static_cast<unsigned char>(data[i - 1]) & 0xC0) == 0x80) {
+    --i;
+    ++continuationBytes;
+  }
+
+  if (i == 0) return len;
+
+  const int expectedBytes = utf8CodepointLen(static_cast<unsigned char>(data[i - 1]));
+  const size_t actualBytes = continuationBytes + 1;
+  if (expectedBytes > static_cast<int>(actualBytes)) {
+    return i - 1;
+  }
+  return len;
+}
+
+bool isBreakWhitespaceCodepoint(const uint32_t cp) {
+  return cp == ' ' || cp == '\r' || cp == '\n' || cp == '\t' || cp == 0x00A0 || cp == 0x2002 || cp == 0x2003;
+}
 }  // namespace
 
 PlainTextParser::PlainTextParser(std::string filepath, GfxRenderer& renderer, const RenderConfig& config)
@@ -49,6 +80,7 @@ bool PlainTextParser::parsePages(const std::function<void(std::unique_ptr<Page>)
   int16_t currentPageY = 0;
   uint16_t pagesCreated = 0;
   std::string partialWord;
+  std::string utf8Carry;
   uint16_t abortCheckCounter = 0;
 
   auto startNewPage = [&]() {
@@ -125,11 +157,25 @@ bool PlainTextParser::parsePages(const std::function<void(std::unique_ptr<Page>)
 
     buffer[bytesRead] = '\0';
 
-    for (size_t i = 0; i < bytesRead; i++) {
-      char c = static_cast<char>(buffer[i]);
+    std::string chunkData = utf8Carry;
+    chunkData.append(reinterpret_cast<const char*>(buffer), bytesRead);
+    const size_t processLen = utf8CompletePrefixLength(chunkData.data(), chunkData.size());
+    utf8Carry.assign(chunkData.data() + processLen, chunkData.size() - processLen);
+
+    std::string processChunk = chunkData.substr(0, processLen);
+    processChunk.push_back('\0');
+    const size_t carryLenBeforeRead = chunkData.size() - bytesRead;
+
+    const char* ptr = processChunk.c_str();
+    while (*ptr) {
+      const char* cpStart = ptr;
+      const uint32_t cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&ptr));
+      const size_t cpBytes = static_cast<size_t>(ptr - cpStart);
+      const size_t cpStartOffset = static_cast<size_t>(cpStart - processChunk.c_str());
+      const size_t cpStartOffsetInRead = cpStartOffset >= carryLenBeforeRead ? cpStartOffset - carryLenBeforeRead : 0;
 
       // Handle newlines as paragraph breaks
-      if (c == '\n') {
+      if (cp == '\n') {
         // Flush partial word
         if (!partialWord.empty()) {
           partialWord.resize(utf8NormalizeNfc(&partialWord[0], partialWord.size()));
@@ -140,7 +186,7 @@ bool PlainTextParser::parsePages(const std::function<void(std::unique_ptr<Page>)
         // Flush current block (paragraph)
         if (!flushBlock()) {
           // Rewind to the \n so next parse re-reads it and flushes pendingBlock_
-          currentOffset_ = file.position() - (bytesRead - i);
+          currentOffset_ = file.position() - (bytesRead - cpStartOffsetInRead);
           hasMore_ = true;
           file.close();
 
@@ -170,7 +216,7 @@ bool PlainTextParser::parsePages(const std::function<void(std::unique_ptr<Page>)
         continue;
       }
 
-      if (isWhitespace(c)) {
+      if (isBreakWhitespaceCodepoint(cp)) {
         if (!partialWord.empty()) {
           partialWord.resize(utf8NormalizeNfc(&partialWord[0], partialWord.size()));
           currentBlock->addWord(partialWord, EpdFontFamily::REGULAR);
@@ -179,7 +225,7 @@ bool PlainTextParser::parsePages(const std::function<void(std::unique_ptr<Page>)
         continue;
       }
 
-      partialWord += c;
+      partialWord.append(cpStart, cpBytes);
 
       // Prevent extremely long words from accumulating
       if (partialWord.length() > 100) {
@@ -209,7 +255,7 @@ bool PlainTextParser::parsePages(const std::function<void(std::unique_ptr<Page>)
     // Check if we hit max pages
     if (maxPages > 0 && pagesCreated >= maxPages) {
       // Back up offset to re-read the partial word on next parse
-      size_t backupBytes = partialWord.length();
+      size_t backupBytes = partialWord.length() + utf8Carry.length();
       currentOffset_ = file.position() - backupBytes;
       // Preserve the partially-accumulated paragraph block for next parse
       if (currentBlock && !currentBlock->isEmpty()) {
@@ -222,6 +268,9 @@ bool PlainTextParser::parsePages(const std::function<void(std::unique_ptr<Page>)
   }
 
   // Flush remaining content
+  if (!utf8Carry.empty()) {
+    partialWord += utf8Carry;
+  }
   if (!partialWord.empty()) {
     partialWord.resize(utf8NormalizeNfc(&partialWord[0], partialWord.size()));
     currentBlock->addWord(partialWord, EpdFontFamily::REGULAR);
