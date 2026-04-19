@@ -37,9 +37,24 @@ struct CardDimensions {
 };
 
 struct HomeView {
-  static constexpr int MAX_TITLE_LEN = 64;
-  static constexpr int MAX_AUTHOR_LEN = 48;
+  static constexpr int MAX_TITLE_LEN = 256;
+  static constexpr int MAX_AUTHOR_LEN = 128;
   static constexpr int MAX_PATH_LEN = 128;
+
+  // Copy src into dst (maxBytes includes null terminator), truncating at a valid UTF-8 boundary.
+  static void safeUtf8Copy(char* dst, const char* src, int maxBytes) {
+    strncpy(dst, src, maxBytes - 1);
+    dst[maxBytes - 1] = '\0';
+    int len = static_cast<int>(strlen(dst));
+    // Strip trailing UTF-8 continuation bytes (0x80–0xBF) left by a cut sequence.
+    while (len > 0 && (static_cast<uint8_t>(dst[len - 1]) & 0xC0) == 0x80) {
+      dst[--len] = '\0';
+    }
+    // If we stopped on an incomplete leading byte (0xC0–0xFF), strip it too.
+    if (len > 0 && (static_cast<uint8_t>(dst[len - 1]) & 0x80)) {
+      dst[--len] = '\0';
+    }
+  }
 
   ButtonBar buttons{"", "File", "Sync", "Settings"};
 
@@ -65,12 +80,9 @@ struct HomeView {
   bool needsRender = true;
 
   void setBook(const char* title, const char* author, const char* path) {
-    strncpy(bookTitle, title, MAX_TITLE_LEN - 1);
-    bookTitle[MAX_TITLE_LEN - 1] = '\0';
-    strncpy(bookAuthor, author, MAX_AUTHOR_LEN - 1);
-    bookAuthor[MAX_AUTHOR_LEN - 1] = '\0';
-    strncpy(bookPath, path, MAX_PATH_LEN - 1);
-    bookPath[MAX_PATH_LEN - 1] = '\0';
+    safeUtf8Copy(bookTitle, title, MAX_TITLE_LEN);
+    safeUtf8Copy(bookAuthor, author, MAX_AUTHOR_LEN);
+    safeUtf8Copy(bookPath, path, MAX_PATH_LEN);
     hasBook = true;
     buttons.labels[0] = "Read";
     needsRender = true;

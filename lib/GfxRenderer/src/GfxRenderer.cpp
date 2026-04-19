@@ -700,18 +700,11 @@ std::vector<std::string> GfxRenderer::wrapTextWithHyphenation(const int fontId, 
       }
     }
 
-    // Handle last line truncation
-    if (isLastLine && !remaining.empty() && static_cast<int>(lines.size()) == maxLines) {
-      // Last line but text remains - truncate with "..."
-      std::string& lastLine = lines.back();
-      lastLine = truncatedText(fontId, lastLine.c_str(), maxWidth, style);
-    }
   }
 
-  // If we have remaining text and hit maxLines, truncate the last line
+  // If text remains after hitting maxLines, fold it into the last line and truncate with "..."
   if (!remaining.empty() && static_cast<int>(lines.size()) == maxLines) {
     std::string& lastLine = lines.back();
-    // Append remaining text and truncate
     if (getTextWidth(fontId, lastLine.c_str(), style) < maxWidth) {
       std::string combined = lastLine + " " + remaining;
       lastLine = truncatedText(fontId, combined.c_str(), maxWidth, style);
