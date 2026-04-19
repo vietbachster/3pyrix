@@ -106,8 +106,9 @@ bool PlainTextParser::parsePages(const std::function<void(std::unique_ptr<Page>)
   if (pendingBlock_) {
     currentBlock = std::move(pendingBlock_);
   } else {
-    currentBlock.reset(new ParsedText(static_cast<TextBlock::BLOCK_STYLE>(config_.paragraphAlignment),
-                                      config_.indentLevel, config_.hyphenation, config_.hyphenation, isRtl_));
+    currentBlock.reset(
+        new ParsedText(static_cast<TextBlock::BLOCK_STYLE>(config_.paragraphAlignment), config_.indentLevel,
+                       config_.hyphenation, true, isRtl_));
   }
 
   while (file.available() > 0) {
@@ -152,8 +153,9 @@ bool PlainTextParser::parsePages(const std::function<void(std::unique_ptr<Page>)
         }
 
         // Start new paragraph
-        currentBlock.reset(new ParsedText(static_cast<TextBlock::BLOCK_STYLE>(config_.paragraphAlignment),
-                                          config_.indentLevel, config_.hyphenation, config_.hyphenation, isRtl_));
+        currentBlock.reset(
+            new ParsedText(static_cast<TextBlock::BLOCK_STYLE>(config_.paragraphAlignment), config_.indentLevel,
+                           config_.hyphenation, true, isRtl_));
 
         // Add paragraph spacing
         switch (config_.spacingLevel) {

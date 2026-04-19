@@ -11,7 +11,7 @@
 #include "ContentParser.h"
 
 namespace {
-constexpr uint8_t CACHE_FILE_VERSION = 19;  // v19: persist reader font size for orientation-specific hardcoded line height
+constexpr uint8_t CACHE_FILE_VERSION = 20;  // v20: invalidate caches after line-breaker behavior change
 
 // Header layout:
 // - version (1 byte)

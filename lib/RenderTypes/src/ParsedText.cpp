@@ -251,6 +251,7 @@ bool ParsedText::layoutAndExtractLines(const GfxRenderer& renderer, const int fo
 
   const int pageWidth = viewportWidth;
   const int spaceWidth = renderer.getSpaceWidth(fontId);
+  const int firstLineIndentWidth = getFirstLineIndentWidth(renderer, fontId);
 
   // Rejoin words that were split by a previous interrupted greedy layout pass.
   // Split prefixes are marked with trailing U+00AD; rejoin with the following suffix word.
@@ -284,8 +285,9 @@ bool ParsedText::layoutAndExtractLines(const GfxRenderer& renderer, const int fo
 
   auto wordWidths = calculateWordWidths(renderer, fontId);
   const auto lineBreakIndices =
-      useGreedyBreaking ? computeLineBreaksGreedy(renderer, fontId, pageWidth, spaceWidth, wordWidths, shouldAbort)
-                        : computeLineBreaks(pageWidth, spaceWidth, wordWidths, shouldAbort);
+      useGreedyBreaking
+          ? computeLineBreaksGreedy(renderer, fontId, pageWidth, spaceWidth, wordWidths, shouldAbort)
+          : computeLineBreaks(pageWidth, spaceWidth, firstLineIndentWidth, wordWidths, shouldAbort);
 
   // Check if we were aborted during line break computation
   if (shouldAbort && shouldAbort()) {
@@ -298,9 +300,28 @@ bool ParsedText::layoutAndExtractLines(const GfxRenderer& renderer, const int fo
     if (shouldAbort && shouldAbort()) {
       return false;
     }
-    extractLine(i, pageWidth, spaceWidth, wordWidths, lineBreakIndices, processLine);
+    extractLine(i, pageWidth, spaceWidth, firstLineIndentWidth, wordWidths, lineBreakIndices, processLine);
   }
   return true;
+}
+
+int ParsedText::getFirstLineIndentWidth(const GfxRenderer& renderer, const int fontId) const {
+  if (isRtl || words.empty() || indentLevel == 0 || style == TextBlock::CENTER_ALIGN) {
+    return 0;
+  }
+
+  const EpdFontFamily::Style firstWordStyle = wordStyles.empty() ? EpdFontFamily::REGULAR : wordStyles.front();
+  const int spaceWidth = renderer.getTextWidth(fontId, " ", firstWordStyle);
+  if (spaceWidth <= 0) return 0;
+
+  switch (indentLevel) {
+    case 2:
+      return spaceWidth * 2;  // Match U+2003 fallback in renderChar()
+    case 3:
+      return spaceWidth * 3;  // Match U+2003 + U+2002 fallback
+    default:
+      return spaceWidth;  // Match U+2002 fallback in renderChar()
+  }
 }
 
 std::vector<uint16_t> ParsedText::calculateWordWidths(const GfxRenderer& renderer, const int fontId) {
@@ -308,25 +329,6 @@ std::vector<uint16_t> ParsedText::calculateWordWidths(const GfxRenderer& rendere
 
   std::vector<uint16_t> wordWidths;
   wordWidths.reserve(totalWordCount);
-
-  // Add indentation at the beginning of first word in paragraph exactly once.
-  // ParsedText may be laid out incrementally across multiple calls when paging;
-  // guard with indentApplied to avoid re-indenting carried-over content.
-  if (!indentApplied && indentLevel > 0 && !words.empty() && style != TextBlock::CENTER_ALIGN) {
-    std::string& first_word = words.front();
-    switch (indentLevel) {
-      case 2:  // Normal - em-space (U+2003)
-        first_word.insert(0, "\xe2\x80\x83");
-        break;
-      case 3:  // Large - em-space + en-space (U+2003 + U+2002)
-        first_word.insert(0, "\xe2\x80\x83\xe2\x80\x82");
-        break;
-      default:  // Fallback for unexpected values: single en-space (U+2002)
-        first_word.insert(0, "\xe2\x80\x82");
-        break;
-    }
-    indentApplied = true;
-  }
 
   auto wordsIt = words.begin();
   auto wordStylesIt = wordStyles.begin();
@@ -348,6 +350,7 @@ std::vector<uint16_t> ParsedText::calculateWordWidths(const GfxRenderer& rendere
 }
 
 std::vector<size_t> ParsedText::computeLineBreaks(const int pageWidth, const int spaceWidth,
+                                                  const int firstLineIndentWidth,
                                                   const std::vector<uint16_t>& wordWidths,
                                                   const AbortCallback& shouldAbort) const {
   const size_t n = words.size();
@@ -369,11 +372,13 @@ std::vector<size_t> ParsedText::computeLineBreaks(const int pageWidth, const int
 
     if (minDemerits[i] >= INFINITY_PENALTY) continue;
 
-    int lineWidth = -spaceWidth;  // First word won't have preceding space
+    const int effectivePageWidth = std::max(1, (i == 0) ? pageWidth - firstLineIndentWidth : pageWidth);
+    int lineWidth = 0;
     for (size_t j = i; j < n; j++) {
-      lineWidth += wordWidths[j] + spaceWidth;
+      const int gapBefore = (j > i && !wordContinues[j]) ? spaceWidth : 0;
+      lineWidth += gapBefore + wordWidths[j];
 
-      if (lineWidth > pageWidth) {
+      if (lineWidth > effectivePageWidth) {
         if (j == i) {
           // Oversized word: force onto its own line with high penalty
           float demerits = 100.0f + LINE_PENALTY;
@@ -391,7 +396,7 @@ std::vector<size_t> ParsedText::computeLineBreaks(const int pageWidth, const int
       }
 
       bool isLastLine = (j == n - 1);
-      float badness = calculateBadness(lineWidth, pageWidth);
+      float badness = calculateBadness(lineWidth, effectivePageWidth);
       float demerits = calculateDemerits(badness, isLastLine) + LINE_PENALTY;
 
       if (minDemerits[i] + demerits < minDemerits[j + 1]) {
@@ -436,7 +441,9 @@ std::vector<size_t> ParsedText::computeLineBreaksGreedy(const GfxRenderer& rende
 
   auto wordIt = words.begin();
   auto styleIt = wordStyles.begin();
-  int lineWidth = -spaceWidth;  // First word won't have preceding space
+  const int firstLineIndentWidth = getFirstLineIndentWidth(renderer, fontId);
+  int currentLineWidthLimit = std::max(1, pageWidth - firstLineIndentWidth);
+  int lineWidth = 0;
   for (size_t i = 0; i < n; i++, ++wordIt, ++styleIt) {
     // Check for abort periodically (every 200 words)
     if (shouldAbort && (i % 200 == 0) && shouldAbort()) {
@@ -444,32 +451,35 @@ std::vector<size_t> ParsedText::computeLineBreaksGreedy(const GfxRenderer& rende
     }
 
     const int wordWidth = wordWidths[i];
+    const int gapBefore = (lineWidth > 0 && !wordContinues[i]) ? spaceWidth : 0;
 
     // Check if adding this word would overflow the line.
     // Continuation words (attaching punctuation etc.) are never allowed to start a new
     // line — force them onto the current line even if it causes a slight overflow.
-    if (lineWidth + wordWidth + spaceWidth > pageWidth && lineWidth > 0 && !wordContinues[i]) {
+    if (lineWidth + gapBefore + wordWidth > currentLineWidthLimit && lineWidth > 0 && !wordContinues[i]) {
       // Try to hyphenate: split the overflowing word so its first part fits on this line
-      const int remainingWidth = pageWidth - lineWidth - spaceWidth;
+      const int remainingWidth = currentLineWidthLimit - lineWidth - gapBefore;
       if (remainingWidth > 0 &&
           trySplitWordForLineEnd(renderer, fontId, remainingWidth, wordIt, styleIt, i, wordWidths)) {
         // Word was split: prefix is at index i (fits on current line), suffix at i+1.
         // Re-derive iterators: vector insert may have reallocated, invalidating wordIt/styleIt.
         wordIt = words.begin() + static_cast<ptrdiff_t>(i);
         styleIt = wordStyles.begin() + static_cast<ptrdiff_t>(i);
-        lineWidth += wordWidths[i] + spaceWidth;
+        lineWidth += gapBefore + wordWidths[i];
         n = wordWidths.size();  // Vector grew by one
         // End this line after the prefix
         breaks.push_back(i + 1);
         // Next iteration (i+1) starts the suffix on a new line
-        lineWidth = -spaceWidth;  // Will be updated when we process i+1
+        lineWidth = 0;
+        currentLineWidthLimit = pageWidth;
       } else {
         // No hyphenation possible - start a new line at this word
         breaks.push_back(i);
         lineWidth = wordWidth;
+        currentLineWidthLimit = pageWidth;
       }
     } else {
-      lineWidth += wordWidth + spaceWidth;
+      lineWidth += gapBefore + wordWidth;
     }
   }
 
@@ -479,11 +489,13 @@ std::vector<size_t> ParsedText::computeLineBreaksGreedy(const GfxRenderer& rende
 }
 
 void ParsedText::extractLine(const size_t breakIndex, const int pageWidth, const int spaceWidth,
-                             const std::vector<uint16_t>& wordWidths, const std::vector<size_t>& lineBreakIndices,
+                             const int firstLineIndentWidth, const std::vector<uint16_t>& wordWidths,
+                             const std::vector<size_t>& lineBreakIndices,
                              const std::function<void(std::shared_ptr<TextBlock>)>& processLine) {
   const size_t lineBreak = lineBreakIndices[breakIndex];
   const size_t lastBreakAt = breakIndex > 0 ? lineBreakIndices[breakIndex - 1] : 0;
   const size_t lineWordCount = lineBreak - lastBreakAt;
+  const int lineIndent = (breakIndex == 0 && !isRtl && style != TextBlock::CENTER_ALIGN) ? firstLineIndentWidth : 0;
 
   // Calculate total word width for this line and count actual word gaps
   // (continuation words that attach to previous don't count as a gap)
@@ -501,7 +513,8 @@ void ParsedText::extractLine(const size_t breakIndex, const int pageWidth, const
   }
 
   // Calculate spacing
-  const int spareSpace = pageWidth - lineWordWidthSum;
+  const int effectivePageWidth = std::max(1, pageWidth - lineIndent);
+  const int spareSpace = effectivePageWidth - lineWordWidthSum;
 
   int spacing = spaceWidth;
   int spacingRemainder = 0;
@@ -551,9 +564,9 @@ void ParsedText::extractLine(const size_t breakIndex, const int pageWidth, const
     }
   } else {
     // LTR: Position words from left to right
-    uint16_t xpos = 0;
+    uint16_t xpos = lineIndent;
     if (effectiveStyle == TextBlock::RIGHT_ALIGN) {
-      xpos = spareSpace - static_cast<int>(actualGapCount) * spaceWidth;
+      xpos = lineIndent + spareSpace - static_cast<int>(actualGapCount) * spaceWidth;
     } else if (effectiveStyle == TextBlock::CENTER_ALIGN) {
       xpos = (spareSpace - static_cast<int>(actualGapCount) * spaceWidth) / 2;
     }

@@ -23,12 +23,13 @@ class ParsedText {
   std::vector<bool> wordContinues;  // true = word attaches to previous (no space gap)
   TextBlock::BLOCK_STYLE style;
   uint8_t indentLevel;
-  bool indentApplied = false;
   bool hyphenationEnabled;
   bool useGreedyBreaking = true;  // Default to greedy to avoid Knuth-Plass memory spike
   bool isRtl = false;
 
-  std::vector<size_t> computeLineBreaks(int pageWidth, int spaceWidth, const std::vector<uint16_t>& wordWidths,
+  int getFirstLineIndentWidth(const GfxRenderer& renderer, int fontId) const;
+  std::vector<size_t> computeLineBreaks(int pageWidth, int spaceWidth, int firstLineIndentWidth,
+                                        const std::vector<uint16_t>& wordWidths,
                                         const AbortCallback& shouldAbort = nullptr) const;
   std::vector<size_t> computeLineBreaksGreedy(const GfxRenderer& renderer, int fontId, int pageWidth, int spaceWidth,
                                               std::vector<uint16_t>& wordWidths,
@@ -37,8 +38,8 @@ class ParsedText {
                               std::vector<std::string>::iterator wordIt,
                               std::vector<EpdFontFamily::Style>::iterator styleIt, size_t wordIndex,
                               std::vector<uint16_t>& wordWidths);
-  void extractLine(size_t breakIndex, int pageWidth, int spaceWidth, const std::vector<uint16_t>& wordWidths,
-                   const std::vector<size_t>& lineBreakIndices,
+  void extractLine(size_t breakIndex, int pageWidth, int spaceWidth, int firstLineIndentWidth,
+                   const std::vector<uint16_t>& wordWidths, const std::vector<size_t>& lineBreakIndices,
                    const std::function<void(std::shared_ptr<TextBlock>)>& processLine);
   std::vector<uint16_t> calculateWordWidths(const GfxRenderer& renderer, int fontId);
   bool preSplitOversizedWords(const GfxRenderer& renderer, int fontId, int pageWidth,

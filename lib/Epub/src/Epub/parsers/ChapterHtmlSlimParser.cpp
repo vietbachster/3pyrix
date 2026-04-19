@@ -53,6 +53,7 @@ bool matches(const char* tag_name, const char* possible_tags[], const int possib
 void ChapterHtmlSlimParser::flushPartWordBuffer() {
   if (!currentTextBlock || partWordBufferIndex == 0) {
     partWordBufferIndex = 0;
+    nextWordContinues = false;
     return;
   }
 
@@ -71,12 +72,14 @@ void ChapterHtmlSlimParser::flushPartWordBuffer() {
 
   partWordBuffer[partWordBufferIndex] = '\0';
   partWordBufferIndex = utf8NormalizeNfc(partWordBuffer, partWordBufferIndex);
-  currentTextBlock->addWord(partWordBuffer, fontStyle);
+  currentTextBlock->addWord(partWordBuffer, fontStyle, nextWordContinues);
   partWordBufferIndex = 0;
+  nextWordContinues = false;
 }
 
 // start a new text block if needed
 void ChapterHtmlSlimParser::startNewTextBlock(const TextBlock::BLOCK_STYLE style) {
+  nextWordContinues = false;
   if (currentTextBlock) {
     // already have a text block running and it is empty - just reuse it
     if (currentTextBlock->isEmpty()) {
@@ -97,7 +100,7 @@ void ChapterHtmlSlimParser::startNewTextBlock(const TextBlock::BLOCK_STYLE style
       return;
     }
   }
-  currentTextBlock.reset(new ParsedText(style, config.indentLevel, config.hyphenation, config.hyphenation, pendingRtl_));
+  currentTextBlock.reset(new ParsedText(style, config.indentLevel, config.hyphenation, true, pendingRtl_));
 }
 
 void XMLCALL ChapterHtmlSlimParser::startElement(void* userData, const XML_Char* name, const XML_Char** atts) {
@@ -403,7 +406,26 @@ void XMLCALL ChapterHtmlSlimParser::characterData(void* userData, const XML_Char
       if (self->partWordBufferIndex > 0) {
         self->flushPartWordBuffer();
       }
+      self->nextWordContinues = false;
       // Skip the whitespace char
+      continue;
+    }
+
+    // U+00A0 NBSP encoded as UTF-8 0xC2 0xA0.
+    // Keep it non-breaking by emitting a standalone space token attached on both sides.
+    if (static_cast<uint8_t>(s[i]) == 0xC2 && i + 1 < len && static_cast<uint8_t>(s[i + 1]) == 0xA0) {
+      if (self->partWordBufferIndex > 0) {
+        self->flushPartWordBuffer();
+      }
+
+      self->partWordBuffer[0] = ' ';
+      self->partWordBuffer[1] = '\0';
+      self->partWordBufferIndex = 1;
+      self->nextWordContinues = true;
+      self->flushPartWordBuffer();
+
+      self->nextWordContinues = true;
+      i++;
       continue;
     }
 
@@ -793,7 +815,7 @@ bool ChapterHtmlSlimParser::resumeParsing() {
   if (pendingNewTextBlock_) {
     pendingNewTextBlock_ = false;
     currentTextBlock.reset(
-        new ParsedText(pendingBlockStyle_, config.indentLevel, config.hyphenation, config.hyphenation, pendingRtl_));
+        new ParsedText(pendingBlockStyle_, config.indentLevel, config.hyphenation, true, pendingRtl_));
     if (pendingListMarker_[0] != '\0') {
       currentTextBlock->addWord(pendingListMarker_, EpdFontFamily::REGULAR);
       pendingListMarker_[0] = '\0';
