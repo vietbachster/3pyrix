@@ -12,6 +12,28 @@
 
 #define TAG "FONT"
 
+namespace {
+
+void freeOwnedTables(EpdFontData* data) {
+  if (!data) return;
+
+  delete[] data->kernLeftClasses;
+  delete[] data->kernRightClasses;
+  delete[] data->kernMatrix;
+  delete[] data->ligaturePairs;
+  data->kernLeftClasses = nullptr;
+  data->kernRightClasses = nullptr;
+  data->kernMatrix = nullptr;
+  data->kernLeftEntryCount = 0;
+  data->kernRightEntryCount = 0;
+  data->kernLeftClassCount = 0;
+  data->kernRightClassCount = 0;
+  data->ligaturePairs = nullptr;
+  data->ligaturePairCount = 0;
+}
+
+}  // namespace
+
 FontManager& FontManager::instance() {
   static FontManager instance;
   return instance;
@@ -117,10 +139,7 @@ FontManager::LoadedFont FontManager::loadSingleFont(const char* path) {
   result.intervals = loaded.intervals;
   result.font = new (std::nothrow) EpdFont(result.data);
   if (!result.font) {
-    delete result.data;
-    delete[] result.bitmap;
-    delete[] result.glyphs;
-    delete[] result.intervals;
+    EpdFontLoader::freeLoadResult(loaded);
     result = {};
     return result;
   }
@@ -166,6 +185,7 @@ void FontManager::freeFont(LoadedFont& font) {
 
   // Free full-load font resources if present
   delete font.font;
+  freeOwnedTables(font.data);
   delete font.data;
   delete[] font.bitmap;
   delete[] font.glyphs;

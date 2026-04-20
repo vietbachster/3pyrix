@@ -14,22 +14,33 @@
  *     - Flags: uint16_t (2 bytes, bit 0 = is2Bit)
  *     - Reserved: 8 bytes
  *
- *   Metrics (12 bytes):
+ *   Metrics (18 bytes):
  *     - advanceY: uint8_t
+ *     - padding: uint8_t
  *     - ascender: int16_t
  *     - descender: int16_t
  *     - intervalCount: uint32_t
- *     - glyphCount: uint32_t (inferred from intervals)
+ *     - glyphCount: uint32_t
  *     - bitmapSize: uint32_t
+ *
+ *   Version 2 adds a 12-byte table-count block after Metrics:
+ *     - kernLeftEntryCount: uint16_t
+ *     - kernRightEntryCount: uint16_t
+ *     - kernLeftClassCount: uint8_t
+ *     - kernRightClassCount: uint8_t
+ *     - reserved: uint16_t
+ *     - ligaturePairCount: uint32_t
  *
  *   Intervals: intervalCount * sizeof(EpdUnicodeInterval)
  *   Glyphs: glyphCount * sizeof(EpdGlyph)
+ *   Kerning / ligature tables (version 2 only)
  *   Bitmap: bitmapSize bytes
  */
 class EpdFontLoader {
  public:
   static constexpr uint32_t MAGIC = 0x46445045;  // "EPDF" in little-endian
-  static constexpr uint16_t VERSION = 1;
+  static constexpr uint16_t LEGACY_VERSION = 1;
+  static constexpr uint16_t VERSION = 2;
 
   struct LoadResult {
     bool success;
@@ -115,9 +126,18 @@ class EpdFontLoader {
     uint32_t bitmapSize;
   } __attribute__((packed));
 
+  struct FileTablesV2 {
+    uint16_t kernLeftEntryCount;
+    uint16_t kernRightEntryCount;
+    uint8_t kernLeftClassCount;
+    uint8_t kernRightClassCount;
+    uint16_t reserved;
+    uint32_t ligaturePairCount;
+  } __attribute__((packed));
+
   /**
    * Validate font metrics and check memory availability.
    * @return true if metrics are valid and memory is available
    */
-  static bool validateMetricsAndMemory(const FileMetrics& metrics);
+  static bool validateMetricsAndMemory(const FileMetrics& metrics, size_t extraTableBytes = 0);
 };
