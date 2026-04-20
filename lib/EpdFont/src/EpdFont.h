@@ -49,6 +49,9 @@ class EpdFont {
   bool hasPrintableChars(const char* string) const;
 
   const EpdGlyph* getGlyph(uint32_t cp) const;
+  int8_t getKerning(uint32_t leftCp, uint32_t rightCp) const;
+  uint32_t getLigature(uint32_t leftCp, uint32_t rightCp) const;
+  uint32_t applyLigatures(uint32_t cp, const char*& text) const;
 
  private:
   mutable GlyphCache glyphCache;

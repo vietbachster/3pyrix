@@ -28,19 +28,20 @@ class ParsedText {
   bool isRtl = false;
 
   int getFirstLineIndentWidth(const GfxRenderer& renderer, int fontId) const;
-  std::vector<size_t> computeLineBreaks(int pageWidth, int spaceWidth, int firstLineIndentWidth,
+  std::vector<size_t> computeLineBreaks(const GfxRenderer& renderer, int fontId, int pageWidth, int firstLineIndentWidth,
                                         const std::vector<uint16_t>& wordWidths,
                                         const AbortCallback& shouldAbort = nullptr) const;
-  std::vector<size_t> computeLineBreaksGreedy(const GfxRenderer& renderer, int fontId, int pageWidth, int spaceWidth,
+  std::vector<size_t> computeLineBreaksGreedy(const GfxRenderer& renderer, int fontId, int pageWidth,
                                               std::vector<uint16_t>& wordWidths,
                                               const AbortCallback& shouldAbort = nullptr);
   bool trySplitWordForLineEnd(const GfxRenderer& renderer, int fontId, int remainingWidth,
                               std::vector<std::string>::iterator wordIt,
                               std::vector<EpdFontFamily::Style>::iterator styleIt, size_t wordIndex,
                               std::vector<uint16_t>& wordWidths);
-  void extractLine(size_t breakIndex, int pageWidth, int spaceWidth, int firstLineIndentWidth,
+  void extractLine(size_t breakIndex, int pageWidth, int firstLineIndentWidth,
                    const std::vector<uint16_t>& wordWidths, const std::vector<size_t>& lineBreakIndices,
-                   const std::function<void(std::shared_ptr<TextBlock>)>& processLine);
+                   const std::function<void(std::shared_ptr<TextBlock>)>& processLine, const GfxRenderer& renderer,
+                   int fontId);
   std::vector<uint16_t> calculateWordWidths(const GfxRenderer& renderer, int fontId);
   bool preSplitOversizedWords(const GfxRenderer& renderer, int fontId, int pageWidth,
                               const AbortCallback& shouldAbort = nullptr);

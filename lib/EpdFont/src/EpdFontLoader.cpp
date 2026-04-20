@@ -86,7 +86,7 @@ EpdFontLoader::LoadResult EpdFontLoader::loadFromFile(const char* path) {
     result.intervals = new (std::nothrow) EpdUnicodeInterval[metrics.intervalCount];
     result.glyphs = new (std::nothrow) EpdGlyph[metrics.glyphCount];
     result.bitmap = new (std::nothrow) uint8_t[metrics.bitmapSize];
-    result.fontData = new (std::nothrow) EpdFontData;
+    result.fontData = new (std::nothrow) EpdFontData{};
 
     if (!result.intervals || !result.glyphs || !result.bitmap || !result.fontData) {
       LOG_ERR(TAG, "Memory allocation failed");
@@ -343,7 +343,7 @@ EpdFontLoader::LoadResult EpdFontLoader::loadFromLittleFS(const char* path) {
   result.intervals = new (std::nothrow) EpdUnicodeInterval[metrics.intervalCount];
   result.glyphs = new (std::nothrow) EpdGlyph[metrics.glyphCount];
   result.bitmap = new (std::nothrow) uint8_t[metrics.bitmapSize];
-  result.fontData = new (std::nothrow) EpdFontData;
+  result.fontData = new (std::nothrow) EpdFontData{};
 
   if (!result.intervals || !result.glyphs || !result.bitmap || !result.fontData) {
     LOG_ERR(TAG, "Memory allocation failed");

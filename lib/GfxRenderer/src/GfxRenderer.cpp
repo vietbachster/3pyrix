@@ -106,16 +106,6 @@ void GfxRenderer::drawPixel(const int x, const int y, const bool state) const {
 int GfxRenderer::getTextWidth(const int fontId, const char* text, const EpdFontFamily::Style style) const {
   if (!text || !*text) return 0;
 
-  if (fontMap.count(fontId) == 0) {
-    LOG_ERR(TAG, "Font %d not found", fontId);
-    return 0;
-  }
-
-  // Trigger lazy loading of deferred font variant (e.g., bold custom font)
-  if (style != EpdFontFamily::REGULAR) {
-    getStreamingFont(fontId, style);
-  }
-
   // Check cache first (significant speedup during EPUB section creation)
   const uint64_t key = makeWidthCacheKey(fontId, text, style);
   size_t slot = key % MAX_WIDTH_CACHE_SIZE;
@@ -127,46 +117,7 @@ int GfxRenderer::getTextWidth(const int fontId, const char* text, const EpdFontF
     slot = (slot + 1) % MAX_WIDTH_CACHE_SIZE;
   }
 
-  int w = 0;
-  if (isExternalFontAllowed(fontId) && ((_externalFont && _externalFont->isLoaded()) || tryResolveExternalFont())) {
-    // Character-by-character: try external font first, then builtin fallback
-    const auto& font = fontMap.at(fontId);
-    const char* ptr = text;
-    uint32_t cp;
-    while ((cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&ptr)))) {
-      const int extWidth = getExternalGlyphWidth(cp);
-      if (extWidth > 0) {
-        w += extWidth;
-      } else {
-        const EpdGlyph* glyph = font.getGlyph(cp, style);
-        if (glyph) {
-          w += glyph->advanceX;
-        } else {
-          const EpdGlyph* fallback = font.getGlyph('?', style);
-          if (fallback) {
-            w += fallback->advanceX;
-          }
-        }
-      }
-    }
-  } else {
-    // Advance-based measurement: sum glyph->advanceX per character.
-    // This matches how drawText advances the cursor, avoiding the bounding-box
-    // underestimate that causes justified lines to overflow the right margin.
-    const auto& font = fontMap.at(fontId);
-    const char* ptr = text;
-    uint32_t cp;
-    while ((cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&ptr)))) {
-      if (utf8IsCombiningMark(cp)) continue;
-      const EpdGlyph* glyph = font.getGlyph(cp, style);
-      if (glyph) {
-        w += glyph->advanceX;
-      } else {
-        const EpdGlyph* fallback = font.getGlyph('?', style);
-        if (fallback) w += fallback->advanceX;
-      }
-    }
-  }
+  const int w = getTextAdvanceX(fontId, text, style);
 
   // Insert into flat hash table; clear if full
   if (widthCacheCount_ >= MAX_WIDTH_CACHE_SIZE) {
@@ -223,33 +174,92 @@ void GfxRenderer::getTextBounds(const int fontId, const char* text, int* minX, i
 
   int cursorX = 0;
   int lastBaseX = 0;
-  int lastBaseAdvance = 0;
+  int lastBaseLeft = 0;
+  int lastBaseWidth = 0;
+  int lastBaseTop = 0;
+  int prevAdvance = 0;
+  uint32_t prevCp = 0;
+  bool prevWasExternal = false;
   const char* ptr = text;
   uint32_t cp;
   while ((cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&ptr)))) {
-    const EpdGlyph* glyph = font.getGlyph(cp, style);
-    if (!glyph) {
-      glyph = font.getGlyph('?', style);
+    const bool isCombining = utf8IsCombiningMark(cp);
+    if (!isCombining) {
+      cp = font.applyLigatures(cp, ptr, style);
     }
-    if (!glyph) {
+
+    const int extWidth = (!isCombining && isExternalFontAllowed(fontId)) ? getExternalGlyphWidth(cp) : 0;
+    const bool currentIsExternal = extWidth > 0;
+
+    if (!isCombining && prevCp != 0) {
+      cursorX += prevAdvance;
+      if (!prevWasExternal && !currentIsExternal) {
+        cursorX += font.getKerning(prevCp, cp, style);
+      }
+    }
+
+    if (currentIsExternal) {
+      const int glyphMinY = baselineY - _externalFont->getCharHeight();
+      const int glyphMaxY = baselineY;
+      if (cursorX < *minX) *minX = cursorX;
+      if (glyphMinY < *minY) *minY = glyphMinY;
+      if (cursorX + extWidth > *maxX) *maxX = cursorX + extWidth;
+      if (glyphMaxY > *maxY) *maxY = glyphMaxY;
+
+      lastBaseX = cursorX;
+      lastBaseLeft = 0;
+      lastBaseWidth = extWidth;
+      lastBaseTop = baselineY;
+      prevAdvance = extWidth;
+      prevCp = cp;
+      prevWasExternal = true;
       continue;
     }
 
-    int glyphX = cursorX + glyph->left;
-    if (utf8IsCombiningMark(cp)) {
-      glyphX = lastBaseX + lastBaseAdvance / 2 - glyph->width / 2 + glyph->left;
-    } else {
-      lastBaseX = cursorX;
-      lastBaseAdvance = glyph->advanceX;
-      cursorX += glyph->advanceX;
+    const EpdGlyph* glyph = font.getGlyph(cp, style);
+    if (!glyph) {
+      if (cp == 0x2002 || cp == 0x2003 || cp == 0x00A0) {
+        const EpdGlyph* spaceGlyph = font.getGlyph(' ', style);
+        prevAdvance = spaceGlyph ? spaceGlyph->advanceX * (cp == 0x2003 ? 2 : 1) : 0;
+        lastBaseX = cursorX;
+        lastBaseLeft = 0;
+        lastBaseWidth = prevAdvance;
+        lastBaseTop = baselineY;
+        prevCp = cp;
+        prevWasExternal = false;
+        continue;
+      }
+      glyph = font.getGlyph('?', style);
     }
+    if (!glyph) continue;
 
-    const int glyphMinY = baselineY + glyph->top - glyph->height;
-    const int glyphMaxY = baselineY + glyph->top;
-    if (glyphX < *minX) *minX = glyphX;
+    const int raiseBy = isCombining ? combiningMark::raiseAboveBase(glyph->top, glyph->height, lastBaseTop) : 0;
+    const int glyphBaseX =
+        isCombining ? combiningMark::centerOver(lastBaseX, lastBaseLeft, lastBaseWidth, glyph->left, glyph->width)
+                    : cursorX;
+    const int glyphBaseY = baselineY - raiseBy;
+
+    const int glyphMinY = glyphBaseY + glyph->top - glyph->height;
+    const int glyphMaxY = glyphBaseY + glyph->top;
+    if (glyphBaseX + glyph->left < *minX) *minX = glyphBaseX + glyph->left;
     if (glyphMinY < *minY) *minY = glyphMinY;
-    if (glyphX + glyph->width > *maxX) *maxX = glyphX + glyph->width;
+    if (glyphBaseX + glyph->left + glyph->width > *maxX) *maxX = glyphBaseX + glyph->left + glyph->width;
     if (glyphMaxY > *maxY) *maxY = glyphMaxY;
+
+    if (!isCombining) {
+      lastBaseX = cursorX;
+      lastBaseLeft = glyph->left;
+      lastBaseWidth = glyph->width;
+      lastBaseTop = glyph->top;
+      prevAdvance = glyph->advanceX;
+      prevCp = cp;
+      prevWasExternal = false;
+    }
+  }
+
+  if (*minY == 0x7FFF) {
+    *minY = 0;
+    *maxY = 0;
   }
 }
 
@@ -284,24 +294,66 @@ void GfxRenderer::drawText(const int fontId, const int x, const int y, const cha
   }
 
   const int yPos = y + getFontAscenderSize(fontId);
-  int xpos = x;
   int lastBaseX = x;
-  int lastBaseAdvance = 0;
+  int lastBaseLeft = 0;
+  int lastBaseWidth = 0;
+  int lastBaseTop = 0;
+  int prevAdvance = 0;
+  uint32_t prevCp = 0;
+  bool prevWasExternal = false;
 
   uint32_t cp;
   while ((cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&text)))) {
     if (utf8IsCombiningMark(cp)) {
       const EpdGlyph* glyph = font.getGlyph(cp, style);
-      if (glyph) {
-        int combX = lastBaseX + lastBaseAdvance / 2 - glyph->width / 2;
-        int combY = yPos - 1;
-        renderChar(font, cp, &combX, &combY, black, style, fontId);
-      }
-    } else {
-      lastBaseX = xpos;
-      renderChar(font, cp, &xpos, &yPos, black, style, fontId);
-      lastBaseAdvance = xpos - lastBaseX;
+      if (!glyph) continue;
+
+      int combX = combiningMark::centerOver(lastBaseX, lastBaseLeft, lastBaseWidth, glyph->left, glyph->width);
+      int combY = yPos - combiningMark::raiseAboveBase(glyph->top, glyph->height, lastBaseTop);
+      renderChar(font, cp, &combX, &combY, black, style, fontId);
+      continue;
     }
+
+    cp = font.applyLigatures(cp, text, style);
+
+    const int extWidth = isExternalFontAllowed(fontId) ? getExternalGlyphWidth(cp) : 0;
+    const bool currentIsExternal = extWidth > 0;
+
+    if (prevCp != 0) {
+      lastBaseX += prevAdvance;
+      if (!prevWasExternal && !currentIsExternal) {
+        lastBaseX += font.getKerning(prevCp, cp, style);
+      }
+    }
+
+    int drawX = lastBaseX;
+    int drawY = yPos;
+    renderChar(font, cp, &drawX, &drawY, black, style, fontId);
+
+    if (currentIsExternal) {
+      lastBaseLeft = 0;
+      lastBaseWidth = extWidth;
+      lastBaseTop = getFontAscenderSize(fontId);
+      prevAdvance = extWidth;
+    } else {
+      const EpdGlyph* glyph = font.getGlyph(cp, style);
+      if (!glyph && (cp == 0x2002 || cp == 0x2003 || cp == 0x00A0)) {
+        const EpdGlyph* spaceGlyph = font.getGlyph(' ', style);
+        prevAdvance = spaceGlyph ? spaceGlyph->advanceX * (cp == 0x2003 ? 2 : 1) : 0;
+        lastBaseLeft = 0;
+        lastBaseWidth = prevAdvance;
+        lastBaseTop = getFontAscenderSize(fontId);
+      } else {
+        if (!glyph) glyph = font.getGlyph('?', style);
+        lastBaseLeft = glyph ? glyph->left : 0;
+        lastBaseWidth = glyph ? glyph->width : 0;
+        lastBaseTop = glyph ? glyph->top : 0;
+        prevAdvance = glyph ? glyph->advanceX : 0;
+      }
+    }
+
+    prevCp = cp;
+    prevWasExternal = currentIsExternal;
   }
 }
 
@@ -745,15 +797,108 @@ int GfxRenderer::getScreenHeight() const {
   return EInkDisplay::DISPLAY_WIDTH;
 }
 
-int GfxRenderer::getSpaceWidth(const int fontId) const {
+int GfxRenderer::getSpaceWidth(const int fontId, const EpdFontFamily::Style style) const {
   auto it = fontMap.find(fontId);
   if (it == fontMap.end()) {
     LOG_ERR(TAG, "Font %d not found", fontId);
     return 0;
   }
 
-  const EpdGlyph* glyph = it->second.getGlyph(' ', EpdFontFamily::REGULAR);
+  if (style != EpdFontFamily::REGULAR) {
+    getStreamingFont(fontId, style);
+  }
+
+  const EpdGlyph* glyph = it->second.getGlyph(' ', style);
   return glyph ? glyph->advanceX : 0;
+}
+
+int GfxRenderer::getSpaceAdvance(const int fontId, const uint32_t leftCp, const uint32_t rightCp,
+                                 const EpdFontFamily::Style style) const {
+  auto it = fontMap.find(fontId);
+  if (it == fontMap.end()) {
+    return 0;
+  }
+
+  if (style != EpdFontFamily::REGULAR) {
+    getStreamingFont(fontId, style);
+  }
+
+  const auto& font = it->second;
+  const EpdGlyph* spaceGlyph = font.getGlyph(' ', style);
+  const int spaceAdvance = spaceGlyph ? spaceGlyph->advanceX : 0;
+  return spaceAdvance + font.getKerning(leftCp, ' ', style) + font.getKerning(' ', rightCp, style);
+}
+
+int GfxRenderer::getKerning(const int fontId, const uint32_t leftCp, const uint32_t rightCp,
+                            const EpdFontFamily::Style style) const {
+  auto it = fontMap.find(fontId);
+  if (it == fontMap.end()) {
+    return 0;
+  }
+
+  if (style != EpdFontFamily::REGULAR) {
+    getStreamingFont(fontId, style);
+  }
+
+  return it->second.getKerning(leftCp, rightCp, style);
+}
+
+int GfxRenderer::getTextAdvanceX(const int fontId, const char* text, const EpdFontFamily::Style style) const {
+  if (!text || !*text) return 0;
+
+  auto it = fontMap.find(fontId);
+  if (it == fontMap.end()) {
+    LOG_ERR(TAG, "Font %d not found", fontId);
+    return 0;
+  }
+
+  if (style != EpdFontFamily::REGULAR) {
+    getStreamingFont(fontId, style);
+  }
+
+  const auto& font = it->second;
+  const char* ptr = text;
+  int width = 0;
+  int prevAdvance = 0;
+  uint32_t prevCp = 0;
+  bool prevWasExternal = false;
+
+  uint32_t cp;
+  while ((cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&ptr)))) {
+    if (utf8IsCombiningMark(cp)) {
+      continue;
+    }
+
+    cp = font.applyLigatures(cp, ptr, style);
+
+    const int extWidth = isExternalFontAllowed(fontId) ? getExternalGlyphWidth(cp) : 0;
+    const bool currentIsExternal = extWidth > 0;
+
+    if (prevCp != 0) {
+      width += prevAdvance;
+      if (!prevWasExternal && !currentIsExternal) {
+        width += font.getKerning(prevCp, cp, style);
+      }
+    }
+
+    if (currentIsExternal) {
+      prevAdvance = extWidth;
+    } else {
+      const EpdGlyph* glyph = font.getGlyph(cp, style);
+      if (!glyph && (cp == 0x2002 || cp == 0x2003 || cp == 0x00A0)) {
+        const EpdGlyph* spaceGlyph = font.getGlyph(' ', style);
+        prevAdvance = spaceGlyph ? spaceGlyph->advanceX * (cp == 0x2003 ? 2 : 1) : 0;
+      } else {
+        if (!glyph) glyph = font.getGlyph('?', style);
+        prevAdvance = glyph ? glyph->advanceX : 0;
+      }
+    }
+
+    prevCp = cp;
+    prevWasExternal = currentIsExternal;
+  }
+
+  return width + prevAdvance;
 }
 
 int GfxRenderer::getFontAscenderSize(const int fontId) const {
