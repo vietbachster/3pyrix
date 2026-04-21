@@ -26,13 +26,14 @@ class ParsedText {
   bool hyphenationEnabled;
   bool useGreedyBreaking = true;  // Default to greedy to avoid Knuth-Plass memory spike
   bool isRtl = false;
+  bool firstLineIndentPending = true;
 
   int getFirstLineIndentWidth(const GfxRenderer& renderer, int fontId) const;
   std::vector<size_t> computeLineBreaks(const GfxRenderer& renderer, int fontId, int pageWidth, int firstLineIndentWidth,
                                         const std::vector<uint16_t>& wordWidths,
                                         const AbortCallback& shouldAbort = nullptr) const;
   std::vector<size_t> computeLineBreaksGreedy(const GfxRenderer& renderer, int fontId, int pageWidth,
-                                              std::vector<uint16_t>& wordWidths,
+                                              int firstLineIndentWidth, std::vector<uint16_t>& wordWidths,
                                               const AbortCallback& shouldAbort = nullptr);
   bool trySplitWordForLineEnd(const GfxRenderer& renderer, int fontId, int remainingWidth,
                               std::vector<std::string>::iterator wordIt,

@@ -282,7 +282,7 @@ bool ParsedText::layoutAndExtractLines(const GfxRenderer& renderer, const int fo
   }
 
   const int pageWidth = viewportWidth;
-  const int firstLineIndentWidth = getFirstLineIndentWidth(renderer, fontId);
+  const int firstLineIndentWidth = firstLineIndentPending ? getFirstLineIndentWidth(renderer, fontId) : 0;
 
   // Rejoin words that were split by a previous interrupted greedy layout pass.
   // Split prefixes are marked with trailing U+00AD; rejoin with the following suffix word.
@@ -317,7 +317,7 @@ bool ParsedText::layoutAndExtractLines(const GfxRenderer& renderer, const int fo
   auto wordWidths = calculateWordWidths(renderer, fontId);
   const auto lineBreakIndices =
       useGreedyBreaking
-          ? computeLineBreaksGreedy(renderer, fontId, pageWidth, wordWidths, shouldAbort)
+          ? computeLineBreaksGreedy(renderer, fontId, pageWidth, firstLineIndentWidth, wordWidths, shouldAbort)
           : computeLineBreaks(renderer, fontId, pageWidth, firstLineIndentWidth, wordWidths, shouldAbort);
 
   // Check if we were aborted during line break computation
@@ -464,7 +464,8 @@ std::vector<size_t> ParsedText::computeLineBreaks(const GfxRenderer& renderer, c
 }
 
 std::vector<size_t> ParsedText::computeLineBreaksGreedy(const GfxRenderer& renderer, const int fontId,
-                                                        const int pageWidth, std::vector<uint16_t>& wordWidths,
+                                                        const int pageWidth, const int firstLineIndentWidth,
+                                                        std::vector<uint16_t>& wordWidths,
                                                         const AbortCallback& shouldAbort) {
   std::vector<size_t> breaks;
   size_t n = wordWidths.size();
@@ -475,7 +476,6 @@ std::vector<size_t> ParsedText::computeLineBreaksGreedy(const GfxRenderer& rende
 
   auto wordIt = words.begin();
   auto styleIt = wordStyles.begin();
-  const int firstLineIndentWidth = getFirstLineIndentWidth(renderer, fontId);
   int currentLineWidthLimit = std::max(1, pageWidth - firstLineIndentWidth);
   int lineWidth = 0;
   for (size_t i = 0; i < n; i++, ++wordIt, ++styleIt) {
@@ -533,7 +533,8 @@ void ParsedText::extractLine(const size_t breakIndex, const int pageWidth, const
   const size_t lineBreak = lineBreakIndices[breakIndex];
   const size_t lastBreakAt = breakIndex > 0 ? lineBreakIndices[breakIndex - 1] : 0;
   const size_t lineWordCount = lineBreak - lastBreakAt;
-  const int lineIndent = (breakIndex == 0 && !isRtl && style != TextBlock::CENTER_ALIGN) ? firstLineIndentWidth : 0;
+  const bool isParagraphFirstExtractedLine = breakIndex == 0 && firstLineIndentPending;
+  const int lineIndent = isParagraphFirstExtractedLine ? firstLineIndentWidth : 0;
 
   // Calculate line width from measured words plus the natural gap between each
   // adjacent pair. Continuation words contribute cross-boundary kerning only.
@@ -641,6 +642,9 @@ void ParsedText::extractLine(const size_t breakIndex, const int pageWidth, const
   words.erase(words.begin(), wordIt);
   wordStyles.erase(wordStyles.begin(), styleIt);
   wordContinues.erase(wordContinues.begin(), continuesIt);
+  if (isParagraphFirstExtractedLine) {
+    firstLineIndentPending = false;
+  }
 
   processLine(std::make_shared<TextBlock>(std::move(lineData), effectiveStyle));
 }
