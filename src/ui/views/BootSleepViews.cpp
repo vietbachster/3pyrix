@@ -11,7 +11,7 @@ void render(const GfxRenderer& r, const Theme& t, const BootView& v) {
 
   r.clearScreen(t.backgroundColor);
 
-  r.drawCenteredText(t.uiFontId, pageHeight / 2 - 10, "Papyrix", t.primaryTextBlack);
+  r.drawCenteredText(t.uiFontId, pageHeight / 2 - 10, "3pyrix", t.primaryTextBlack);
   r.drawCenteredText(t.smallFontId, pageHeight / 2 + 30, v.status, t.primaryTextBlack);
   r.drawCenteredText(t.smallFontId, pageHeight - 30, v.version, t.primaryTextBlack);
 
@@ -27,7 +27,7 @@ void render(const GfxRenderer& r, const Theme& t, const SleepView& v) {
   r.clearScreen(t.backgroundColor);
 
   if (v.mode == SleepView::Mode::Text) {
-    r.drawCenteredText(t.uiFontId, pageHeight / 2 - 10, "Papyrix", t.primaryTextBlack);
+    r.drawCenteredText(t.uiFontId, pageHeight / 2 - 10, "3pyrix", t.primaryTextBlack);
     r.drawCenteredText(t.smallFontId, pageHeight / 2 + 30, "SLEEPING", t.primaryTextBlack);
     if (v.darkMode) {
       r.invertScreen();

@@ -110,7 +110,7 @@ void SleepState::renderDefaultSleepScreen(const Core& core) const {
   // Fixed colors (white bg, black text) — independent of active theme.
   // invertScreen() below handles dark/light based on sleep setting only.
   renderer_.clearScreen(0xFF);
-  renderer_.drawCenteredText(THEME.uiFontId, pageHeight / 2 - 10, "Papyrix", true);
+  renderer_.drawCenteredText(THEME.uiFontId, pageHeight / 2 - 10, "3pyrix", true);
   renderer_.drawCenteredText(THEME.smallFontId, pageHeight / 2 + 30, "SLEEPING", true);
 
   // Make sleep screen dark unless light is selected in settings
