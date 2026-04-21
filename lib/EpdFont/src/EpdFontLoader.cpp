@@ -8,22 +8,127 @@
 
 #define TAG "FONT_LOAD"
 
-static constexpr uint32_t MAX_BITMAP_SIZE = 512 * 1024;  // 512KB
+namespace {
 
-// Binary format: width(1) + height(1) + advanceX(1) + padding(1) +
-//                left(2) + top(2) + dataLength(2) + dataOffset(4) = 14 bytes
-static constexpr int GLYPH_BINARY_SIZE = 14;
+constexpr uint32_t MAX_BITMAP_SIZE = 512 * 1024;  // 512KB
+constexpr int GLYPH_BINARY_SIZE = 14;
 
-bool EpdFontLoader::validateMetricsAndMemory(const FileMetrics& metrics) {
+bool isSupportedVersion(uint16_t version) {
+  return version == EpdFontLoader::LEGACY_VERSION || version == EpdFontLoader::VERSION;
+}
+
+size_t calculateTableBytes(uint16_t kernLeftEntryCount, uint16_t kernRightEntryCount, uint8_t kernLeftClassCount,
+                           uint8_t kernRightClassCount, uint32_t ligaturePairCount) {
+  const size_t kernEntryBytes =
+      static_cast<size_t>(kernLeftEntryCount + kernRightEntryCount) * sizeof(EpdKernClassEntry);
+  const size_t kernMatrixBytes = static_cast<size_t>(kernLeftClassCount) * kernRightClassCount;
+  const size_t ligatureBytes = static_cast<size_t>(ligaturePairCount) * sizeof(EpdLigaturePair);
+  return kernEntryBytes + kernMatrixBytes + ligatureBytes;
+}
+
+void freeFontTables(EpdFontData& fontData) {
+  delete[] fontData.kernLeftClasses;
+  delete[] fontData.kernRightClasses;
+  delete[] fontData.kernMatrix;
+  delete[] fontData.ligaturePairs;
+
+  fontData.kernLeftClasses = nullptr;
+  fontData.kernRightClasses = nullptr;
+  fontData.kernMatrix = nullptr;
+  fontData.kernLeftEntryCount = 0;
+  fontData.kernRightEntryCount = 0;
+  fontData.kernLeftClassCount = 0;
+  fontData.kernRightClassCount = 0;
+  fontData.ligaturePairs = nullptr;
+  fontData.ligaturePairCount = 0;
+}
+
+template <typename FileT>
+bool readExact(FileT& file, void* buffer, size_t size) {
+  return file.read(reinterpret_cast<uint8_t*>(buffer), size) == size;
+}
+
+template <typename FileT>
+bool readGlyphs(FileT& file, EpdGlyph* glyphs, uint32_t glyphCount) {
+  for (uint32_t i = 0; i < glyphCount; i++) {
+    uint8_t glyphData[GLYPH_BINARY_SIZE];
+    if (!readExact(file, glyphData, GLYPH_BINARY_SIZE)) {
+      return false;
+    }
+
+    glyphs[i].width = glyphData[0];
+    glyphs[i].height = glyphData[1];
+    glyphs[i].advanceX = glyphData[2];
+    glyphs[i].left = static_cast<int16_t>(glyphData[4] | (glyphData[5] << 8));
+    glyphs[i].top = static_cast<int16_t>(glyphData[6] | (glyphData[7] << 8));
+    glyphs[i].dataLength = static_cast<uint16_t>(glyphData[8] | (glyphData[9] << 8));
+    glyphs[i].dataOffset =
+        static_cast<uint32_t>(glyphData[10] | (glyphData[11] << 8) | (glyphData[12] << 16) | (glyphData[13] << 24));
+  }
+  return true;
+}
+
+template <typename FileT>
+bool readExtendedTables(FileT& file, EpdFontData& fontData, uint16_t kernLeftEntryCount, uint16_t kernRightEntryCount,
+                        uint8_t kernLeftClassCount, uint8_t kernRightClassCount, uint32_t ligaturePairCount) {
+  if (kernLeftEntryCount > 0) {
+    auto* entries = new (std::nothrow) EpdKernClassEntry[kernLeftEntryCount];
+    if (!entries || !readExact(file, entries, static_cast<size_t>(kernLeftEntryCount) * sizeof(EpdKernClassEntry))) {
+      delete[] entries;
+      return false;
+    }
+    fontData.kernLeftClasses = entries;
+    fontData.kernLeftEntryCount = kernLeftEntryCount;
+  }
+
+  if (kernRightEntryCount > 0) {
+    auto* entries = new (std::nothrow) EpdKernClassEntry[kernRightEntryCount];
+    if (!entries || !readExact(file, entries, static_cast<size_t>(kernRightEntryCount) * sizeof(EpdKernClassEntry))) {
+      delete[] entries;
+      return false;
+    }
+    fontData.kernRightClasses = entries;
+    fontData.kernRightEntryCount = kernRightEntryCount;
+  }
+
+  const size_t kernMatrixSize = static_cast<size_t>(kernLeftClassCount) * kernRightClassCount;
+  if (kernMatrixSize > 0) {
+    auto* matrix = new (std::nothrow) int8_t[kernMatrixSize];
+    if (!matrix || !readExact(file, matrix, kernMatrixSize)) {
+      delete[] matrix;
+      return false;
+    }
+    fontData.kernMatrix = matrix;
+    fontData.kernLeftClassCount = kernLeftClassCount;
+    fontData.kernRightClassCount = kernRightClassCount;
+  }
+
+  if (ligaturePairCount > 0) {
+    auto* pairs = new (std::nothrow) EpdLigaturePair[ligaturePairCount];
+    if (!pairs || !readExact(file, pairs, static_cast<size_t>(ligaturePairCount) * sizeof(EpdLigaturePair))) {
+      delete[] pairs;
+      return false;
+    }
+    fontData.ligaturePairs = pairs;
+    fontData.ligaturePairCount = ligaturePairCount;
+  }
+
+  return true;
+}
+
+}  // namespace
+
+bool EpdFontLoader::validateMetricsAndMemory(const FileMetrics& metrics, const size_t extraTableBytes) {
   if (metrics.intervalCount > 10000 || metrics.glyphCount > 100000 || metrics.bitmapSize > MAX_BITMAP_SIZE) {
     LOG_ERR(TAG, "Font exceeds size limits (bitmap=%u, max=%u). Using default font.", metrics.bitmapSize,
             MAX_BITMAP_SIZE);
     return false;
   }
 
-  size_t requiredMemory = metrics.intervalCount * sizeof(EpdUnicodeInterval) + metrics.glyphCount * sizeof(EpdGlyph) +
-                          metrics.bitmapSize + sizeof(EpdFontData);
-  size_t availableHeap = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+  const size_t requiredMemory =
+      metrics.intervalCount * sizeof(EpdUnicodeInterval) + metrics.glyphCount * sizeof(EpdGlyph) + metrics.bitmapSize +
+      sizeof(EpdFontData) + extraTableBytes;
+  const size_t availableHeap = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
   if (requiredMemory > availableHeap * 0.8) {
     LOG_ERR(TAG, "Insufficient memory: need %zu, available %zu. Using default font.", requiredMemory, availableHeap);
     return false;
@@ -44,9 +149,8 @@ EpdFontLoader::LoadResult EpdFontLoader::loadFromFile(const char* path) {
       continue;
     }
 
-    // Read and validate header
     FileHeader header;
-    if (file.read(reinterpret_cast<uint8_t*>(&header), sizeof(header)) != sizeof(header)) {
+    if (!readExact(file, &header, sizeof(header))) {
       LOG_ERR(TAG, "Failed to read header");
       file.close();
       continue;
@@ -55,90 +159,89 @@ EpdFontLoader::LoadResult EpdFontLoader::loadFromFile(const char* path) {
     if (header.magic != MAGIC) {
       LOG_ERR(TAG, "Invalid magic: 0x%08X (expected 0x%08X)", header.magic, MAGIC);
       file.close();
-      return result;  // Not a transient error
+      return result;
     }
 
-    if (header.version != VERSION) {
-      LOG_ERR(TAG, "Unsupported version: %d (expected %d)", header.version, VERSION);
+    if (!isSupportedVersion(header.version)) {
+      LOG_ERR(TAG, "Unsupported version: %d", header.version);
       file.close();
-      return result;  // Not a transient error
+      return result;
     }
 
-    bool is2Bit = (header.flags & 0x01) != 0;
+    const bool is2Bit = (header.flags & 0x01) != 0;
 
-    // Read metrics
     FileMetrics metrics;
-    if (file.read(reinterpret_cast<uint8_t*>(&metrics), sizeof(metrics)) != sizeof(metrics)) {
+    if (!readExact(file, &metrics, sizeof(metrics))) {
       LOG_ERR(TAG, "Failed to read metrics");
       file.close();
       continue;
     }
 
+    FileTablesV2 tableCounts = {};
+    size_t extraTableBytes = 0;
+    if (header.version >= VERSION) {
+      if (!readExact(file, &tableCounts, sizeof(tableCounts))) {
+        LOG_ERR(TAG, "Failed to read table counts");
+        file.close();
+        continue;
+      }
+      extraTableBytes =
+          calculateTableBytes(tableCounts.kernLeftEntryCount, tableCounts.kernRightEntryCount, tableCounts.kernLeftClassCount,
+                              tableCounts.kernRightClassCount, tableCounts.ligaturePairCount);
+    }
+
     LOG_INF(TAG, "Font: advanceY=%d, ascender=%d, descender=%d, intervals=%u, glyphs=%u, bitmap=%u", metrics.advanceY,
             metrics.ascender, metrics.descender, metrics.intervalCount, metrics.glyphCount, metrics.bitmapSize);
 
-    if (!validateMetricsAndMemory(metrics)) {
+    if (!validateMetricsAndMemory(metrics, extraTableBytes)) {
       file.close();
-      return result;  // Not a transient error
+      return result;
     }
 
-    // Allocate memory
     result.intervals = new (std::nothrow) EpdUnicodeInterval[metrics.intervalCount];
     result.glyphs = new (std::nothrow) EpdGlyph[metrics.glyphCount];
     result.bitmap = new (std::nothrow) uint8_t[metrics.bitmapSize];
-    result.fontData = new (std::nothrow) EpdFontData;
+    result.fontData = new (std::nothrow) EpdFontData{};
 
     if (!result.intervals || !result.glyphs || !result.bitmap || !result.fontData) {
       LOG_ERR(TAG, "Memory allocation failed");
       freeLoadResult(result);
       file.close();
-      return result;  // Not a transient error
+      return result;
     }
 
-    // Read intervals
-    size_t intervalsSize = metrics.intervalCount * sizeof(EpdUnicodeInterval);
-    if (file.read(reinterpret_cast<uint8_t*>(result.intervals), intervalsSize) != intervalsSize) {
+    const size_t intervalsSize = metrics.intervalCount * sizeof(EpdUnicodeInterval);
+    if (!readExact(file, result.intervals, intervalsSize)) {
       LOG_ERR(TAG, "Failed to read intervals");
       freeLoadResult(result);
       file.close();
       continue;
     }
 
-    // Read glyphs (field by field from binary format)
-    bool glyphReadFailed = false;
-    for (uint32_t i = 0; i < metrics.glyphCount; i++) {
-      uint8_t glyphData[GLYPH_BINARY_SIZE];
-      if (file.read(glyphData, GLYPH_BINARY_SIZE) != GLYPH_BINARY_SIZE) {
-        LOG_ERR(TAG, "Failed to read glyph %u", i);
-        glyphReadFailed = true;
-        break;
-      }
-      // Parse fields from binary format
-      result.glyphs[i].width = glyphData[0];
-      result.glyphs[i].height = glyphData[1];
-      result.glyphs[i].advanceX = glyphData[2];
-      // glyphData[3] is padding
-      result.glyphs[i].left = static_cast<int16_t>(glyphData[4] | (glyphData[5] << 8));
-      result.glyphs[i].top = static_cast<int16_t>(glyphData[6] | (glyphData[7] << 8));
-      result.glyphs[i].dataLength = static_cast<uint16_t>(glyphData[8] | (glyphData[9] << 8));
-      result.glyphs[i].dataOffset =
-          static_cast<uint32_t>(glyphData[10] | (glyphData[11] << 8) | (glyphData[12] << 16) | (glyphData[13] << 24));
-    }
-    if (glyphReadFailed) {
+    if (!readGlyphs(file, result.glyphs, metrics.glyphCount)) {
+      LOG_ERR(TAG, "Failed to read glyphs");
       freeLoadResult(result);
       file.close();
       continue;
     }
 
-    // Read bitmap
-    if (file.read(result.bitmap, metrics.bitmapSize) != metrics.bitmapSize) {
+    if (header.version >= VERSION &&
+        !readExtendedTables(file, *result.fontData, tableCounts.kernLeftEntryCount, tableCounts.kernRightEntryCount,
+                            tableCounts.kernLeftClassCount, tableCounts.kernRightClassCount,
+                            tableCounts.ligaturePairCount)) {
+      LOG_ERR(TAG, "Failed to read kerning / ligature tables");
+      freeLoadResult(result);
+      file.close();
+      continue;
+    }
+
+    if (!readExact(file, result.bitmap, metrics.bitmapSize)) {
       LOG_ERR(TAG, "Failed to read bitmap");
       freeLoadResult(result);
       file.close();
       continue;
     }
 
-    // Populate font data structure
     result.fontData->bitmap = result.bitmap;
     result.fontData->glyph = result.glyphs;
     result.fontData->intervals = result.intervals;
@@ -148,14 +251,12 @@ EpdFontLoader::LoadResult EpdFontLoader::loadFromFile(const char* path) {
     result.fontData->descender = metrics.descender;
     result.fontData->is2Bit = is2Bit;
 
-    // Store sizes for memory profiling
     result.bitmapSize = metrics.bitmapSize;
     result.glyphsSize = metrics.glyphCount * sizeof(EpdGlyph);
     result.intervalsSize = intervalsSize;
-
     result.success = true;
-    file.close();
 
+    file.close();
     LOG_INF(TAG, "Loaded %s: %zu bytes (bitmap=%u, glyphs=%zu, intervals=%zu)", path, result.totalSize(),
             metrics.bitmapSize, result.glyphsSize, result.intervalsSize);
     return result;
@@ -165,6 +266,9 @@ EpdFontLoader::LoadResult EpdFontLoader::loadFromFile(const char* path) {
 }
 
 void EpdFontLoader::freeLoadResult(LoadResult& result) {
+  if (result.fontData) {
+    freeFontTables(*result.fontData);
+  }
   delete result.fontData;
   delete[] result.bitmap;
   delete[] result.glyphs;
@@ -183,87 +287,82 @@ EpdFontLoader::StreamingLoadResult EpdFontLoader::loadForStreaming(const char* p
       continue;
     }
 
-    // Read and validate header
     FileHeader header;
-    if (file.read(reinterpret_cast<uint8_t*>(&header), sizeof(header)) != sizeof(header)) {
+    if (!readExact(file, &header, sizeof(header))) {
       file.close();
       continue;
     }
 
-    if (header.magic != MAGIC || header.version != VERSION) {
+    if (header.magic != MAGIC || !isSupportedVersion(header.version)) {
       file.close();
-      return result;  // Not a transient error
+      return result;
     }
 
-    bool is2Bit = (header.flags & 0x01) != 0;
+    const bool is2Bit = (header.flags & 0x01) != 0;
 
-    // Read metrics
     FileMetrics metrics;
-    if (file.read(reinterpret_cast<uint8_t*>(&metrics), sizeof(metrics)) != sizeof(metrics)) {
+    if (!readExact(file, &metrics, sizeof(metrics))) {
       file.close();
       continue;
     }
 
-    // Validate metrics (less strict for streaming - we don't load bitmap into RAM)
+    FileTablesV2 tableCounts = {};
+    size_t extraTableBytes = 0;
+    if (header.version >= VERSION) {
+      if (!readExact(file, &tableCounts, sizeof(tableCounts))) {
+        file.close();
+        continue;
+      }
+      extraTableBytes =
+          calculateTableBytes(tableCounts.kernLeftEntryCount, tableCounts.kernRightEntryCount, tableCounts.kernLeftClassCount,
+                              tableCounts.kernRightClassCount, tableCounts.ligaturePairCount);
+    }
+
     if (metrics.intervalCount > 10000 || metrics.glyphCount > 100000) {
       file.close();
-      return result;  // Not a transient error
+      return result;
     }
 
-    // Calculate required memory (without bitmap)
-    size_t requiredMemory = metrics.intervalCount * sizeof(EpdUnicodeInterval) + metrics.glyphCount * sizeof(EpdGlyph) +
-                            sizeof(EpdFontData);
-    size_t availableHeap = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+    const size_t requiredMemory =
+        metrics.intervalCount * sizeof(EpdUnicodeInterval) + metrics.glyphCount * sizeof(EpdGlyph) +
+        sizeof(EpdFontData) + extraTableBytes;
+    const size_t availableHeap = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
     if (requiredMemory > availableHeap * 0.8) {
       file.close();
-      return result;  // Not a transient error
+      return result;
     }
 
-    // Allocate memory for intervals and glyphs only
     result.intervals = new (std::nothrow) EpdUnicodeInterval[metrics.intervalCount];
     result.glyphs = new (std::nothrow) EpdGlyph[metrics.glyphCount];
-
     if (!result.intervals || !result.glyphs) {
       freeStreamingResult(result);
       file.close();
-      return result;  // Not a transient error
+      return result;
     }
 
-    // Read intervals
-    size_t intervalsSize = metrics.intervalCount * sizeof(EpdUnicodeInterval);
-    if (file.read(reinterpret_cast<uint8_t*>(result.intervals), intervalsSize) != intervalsSize) {
+    const size_t intervalsSize = metrics.intervalCount * sizeof(EpdUnicodeInterval);
+    if (!readExact(file, result.intervals, intervalsSize)) {
       freeStreamingResult(result);
       file.close();
       continue;
     }
 
-    // Read glyphs (field by field from binary format)
-    bool glyphReadFailed = false;
-    for (uint32_t i = 0; i < metrics.glyphCount; i++) {
-      uint8_t glyphData[GLYPH_BINARY_SIZE];
-      if (file.read(glyphData, GLYPH_BINARY_SIZE) != GLYPH_BINARY_SIZE) {
-        glyphReadFailed = true;
-        break;
-      }
-      result.glyphs[i].width = glyphData[0];
-      result.glyphs[i].height = glyphData[1];
-      result.glyphs[i].advanceX = glyphData[2];
-      result.glyphs[i].left = static_cast<int16_t>(glyphData[4] | (glyphData[5] << 8));
-      result.glyphs[i].top = static_cast<int16_t>(glyphData[6] | (glyphData[7] << 8));
-      result.glyphs[i].dataLength = static_cast<uint16_t>(glyphData[8] | (glyphData[9] << 8));
-      result.glyphs[i].dataOffset =
-          static_cast<uint32_t>(glyphData[10] | (glyphData[11] << 8) | (glyphData[12] << 16) | (glyphData[13] << 24));
-    }
-    if (glyphReadFailed) {
+    if (!readGlyphs(file, result.glyphs, metrics.glyphCount)) {
       freeStreamingResult(result);
       file.close();
       continue;
     }
 
-    // Record bitmap offset (current file position after reading glyphs)
+    if (header.version >= VERSION &&
+        !readExtendedTables(file, result.fontData, tableCounts.kernLeftEntryCount, tableCounts.kernRightEntryCount,
+                            tableCounts.kernLeftClassCount, tableCounts.kernRightClassCount,
+                            tableCounts.ligaturePairCount)) {
+      freeStreamingResult(result);
+      file.close();
+      continue;
+    }
+
     result.bitmapOffset = file.position();
-
-    // Populate font data structure (bitmap stays nullptr for streaming)
     result.fontData.bitmap = nullptr;
     result.fontData.glyph = result.glyphs;
     result.fontData.intervals = result.intervals;
@@ -273,12 +372,11 @@ EpdFontLoader::StreamingLoadResult EpdFontLoader::loadForStreaming(const char* p
     result.fontData.descender = metrics.descender;
     result.fontData.is2Bit = is2Bit;
 
-    // Store sizes for memory profiling
     result.glyphCount = metrics.glyphCount;
     result.glyphsSize = metrics.glyphCount * sizeof(EpdGlyph);
     result.intervalsSize = intervalsSize;
-
     result.success = true;
+
     file.close();
     return result;
   }
@@ -287,6 +385,7 @@ EpdFontLoader::StreamingLoadResult EpdFontLoader::loadForStreaming(const char* p
 }
 
 void EpdFontLoader::freeStreamingResult(StreamingLoadResult& result) {
+  freeFontTables(result.fontData);
   delete[] result.glyphs;
   delete[] result.intervals;
   result = {false, {}, nullptr, nullptr, 0, 0, 0, 0};
@@ -301,9 +400,8 @@ EpdFontLoader::LoadResult EpdFontLoader::loadFromLittleFS(const char* path) {
     return result;
   }
 
-  // Read and validate header
   FileHeader header;
-  if (file.read(reinterpret_cast<uint8_t*>(&header), sizeof(header)) != sizeof(header)) {
+  if (!readExact(file, &header, sizeof(header))) {
     LOG_ERR(TAG, "Failed to read header from LittleFS");
     file.close();
     return result;
@@ -315,36 +413,46 @@ EpdFontLoader::LoadResult EpdFontLoader::loadFromLittleFS(const char* path) {
     return result;
   }
 
-  if (header.version != VERSION) {
-    LOG_ERR(TAG, "Unsupported version: %d (expected %d)", header.version, VERSION);
+  if (!isSupportedVersion(header.version)) {
+    LOG_ERR(TAG, "Unsupported version: %d", header.version);
     file.close();
     return result;
   }
 
-  bool is2Bit = (header.flags & 0x01) != 0;
+  const bool is2Bit = (header.flags & 0x01) != 0;
 
-  // Read metrics
   FileMetrics metrics;
-  if (file.read(reinterpret_cast<uint8_t*>(&metrics), sizeof(metrics)) != sizeof(metrics)) {
+  if (!readExact(file, &metrics, sizeof(metrics))) {
     LOG_ERR(TAG, "Failed to read metrics from LittleFS");
     file.close();
     return result;
   }
 
+  FileTablesV2 tableCounts = {};
+  size_t extraTableBytes = 0;
+  if (header.version >= VERSION) {
+    if (!readExact(file, &tableCounts, sizeof(tableCounts))) {
+      LOG_ERR(TAG, "Failed to read table counts from LittleFS");
+      file.close();
+      return result;
+    }
+    extraTableBytes =
+        calculateTableBytes(tableCounts.kernLeftEntryCount, tableCounts.kernRightEntryCount, tableCounts.kernLeftClassCount,
+                            tableCounts.kernRightClassCount, tableCounts.ligaturePairCount);
+  }
+
   LOG_INF(TAG, "Font: advanceY=%d, ascender=%d, descender=%d, intervals=%u, glyphs=%u, bitmap=%u", metrics.advanceY,
           metrics.ascender, metrics.descender, metrics.intervalCount, metrics.glyphCount, metrics.bitmapSize);
 
-  if (!validateMetricsAndMemory(metrics)) {
+  if (!validateMetricsAndMemory(metrics, extraTableBytes)) {
     file.close();
     return result;
   }
 
-  // Allocate memory
   result.intervals = new (std::nothrow) EpdUnicodeInterval[metrics.intervalCount];
   result.glyphs = new (std::nothrow) EpdGlyph[metrics.glyphCount];
   result.bitmap = new (std::nothrow) uint8_t[metrics.bitmapSize];
-  result.fontData = new (std::nothrow) EpdFontData;
-
+  result.fontData = new (std::nothrow) EpdFontData{};
   if (!result.intervals || !result.glyphs || !result.bitmap || !result.fontData) {
     LOG_ERR(TAG, "Memory allocation failed");
     freeLoadResult(result);
@@ -352,45 +460,38 @@ EpdFontLoader::LoadResult EpdFontLoader::loadFromLittleFS(const char* path) {
     return result;
   }
 
-  // Read intervals
-  size_t intervalsSize = metrics.intervalCount * sizeof(EpdUnicodeInterval);
-  if (file.read(reinterpret_cast<uint8_t*>(result.intervals), intervalsSize) != intervalsSize) {
+  const size_t intervalsSize = metrics.intervalCount * sizeof(EpdUnicodeInterval);
+  if (!readExact(file, result.intervals, intervalsSize)) {
     LOG_ERR(TAG, "Failed to read intervals from LittleFS");
     freeLoadResult(result);
     file.close();
     return result;
   }
 
-  // Read glyphs (field by field from binary format)
-  for (uint32_t i = 0; i < metrics.glyphCount; i++) {
-    uint8_t glyphData[GLYPH_BINARY_SIZE];
-    if (file.read(glyphData, GLYPH_BINARY_SIZE) != GLYPH_BINARY_SIZE) {
-      LOG_ERR(TAG, "Failed to read glyph %u from LittleFS", i);
-      freeLoadResult(result);
-      file.close();
-      return result;
-    }
-    // Parse fields from binary format
-    result.glyphs[i].width = glyphData[0];
-    result.glyphs[i].height = glyphData[1];
-    result.glyphs[i].advanceX = glyphData[2];
-    // glyphData[3] is padding
-    result.glyphs[i].left = static_cast<int16_t>(glyphData[4] | (glyphData[5] << 8));
-    result.glyphs[i].top = static_cast<int16_t>(glyphData[6] | (glyphData[7] << 8));
-    result.glyphs[i].dataLength = static_cast<uint16_t>(glyphData[8] | (glyphData[9] << 8));
-    result.glyphs[i].dataOffset =
-        static_cast<uint32_t>(glyphData[10] | (glyphData[11] << 8) | (glyphData[12] << 16) | (glyphData[13] << 24));
+  if (!readGlyphs(file, result.glyphs, metrics.glyphCount)) {
+    LOG_ERR(TAG, "Failed to read glyphs from LittleFS");
+    freeLoadResult(result);
+    file.close();
+    return result;
   }
 
-  // Read bitmap
-  if (file.read(result.bitmap, metrics.bitmapSize) != metrics.bitmapSize) {
+  if (header.version >= VERSION &&
+      !readExtendedTables(file, *result.fontData, tableCounts.kernLeftEntryCount, tableCounts.kernRightEntryCount,
+                          tableCounts.kernLeftClassCount, tableCounts.kernRightClassCount,
+                          tableCounts.ligaturePairCount)) {
+    LOG_ERR(TAG, "Failed to read kerning / ligature tables from LittleFS");
+    freeLoadResult(result);
+    file.close();
+    return result;
+  }
+
+  if (!readExact(file, result.bitmap, metrics.bitmapSize)) {
     LOG_ERR(TAG, "Failed to read bitmap from LittleFS");
     freeLoadResult(result);
     file.close();
     return result;
   }
 
-  // Populate font data structure
   result.fontData->bitmap = result.bitmap;
   result.fontData->glyph = result.glyphs;
   result.fontData->intervals = result.intervals;
@@ -400,14 +501,12 @@ EpdFontLoader::LoadResult EpdFontLoader::loadFromLittleFS(const char* path) {
   result.fontData->descender = metrics.descender;
   result.fontData->is2Bit = is2Bit;
 
-  // Store sizes for memory profiling
   result.bitmapSize = metrics.bitmapSize;
   result.glyphsSize = metrics.glyphCount * sizeof(EpdGlyph);
   result.intervalsSize = intervalsSize;
-
   result.success = true;
-  file.close();
 
+  file.close();
   LOG_INF(TAG, "Loaded %s: %zu bytes (bitmap=%u, glyphs=%zu, intervals=%zu)", path, result.totalSize(),
           metrics.bitmapSize, result.glyphsSize, result.intervalsSize);
   return result;

@@ -202,7 +202,14 @@ class FontManager {
       if (streamingFont) {
         return streamingFont->getMemoryUsage();
       }
-      return bitmapSize + glyphsSize + intervalsSize + sizeof(EpdFontData) + sizeof(EpdFont);
+      size_t tableBytes = 0;
+      if (data) {
+        tableBytes += static_cast<size_t>(data->kernLeftEntryCount + data->kernRightEntryCount) *
+                      sizeof(EpdKernClassEntry);
+        tableBytes += static_cast<size_t>(data->kernLeftClassCount) * data->kernRightClassCount;
+        tableBytes += static_cast<size_t>(data->ligaturePairCount) * sizeof(EpdLigaturePair);
+      }
+      return bitmapSize + glyphsSize + intervalsSize + tableBytes + sizeof(EpdFontData) + sizeof(EpdFont);
     }
   };
 

@@ -131,6 +131,38 @@ bool isCjkCodepoint(uint32_t cp) {
   return false;
 }
 
+uint32_t firstCodepoint(const std::string& text) {
+  if (text.empty()) return 0;
+
+  const auto* ptr = reinterpret_cast<const uint8_t*>(text.c_str());
+  return utf8NextCodepoint(&ptr);
+}
+
+uint32_t lastCodepoint(const std::string& text) {
+  if (text.empty()) return 0;
+
+  const auto* ptr = reinterpret_cast<const uint8_t*>(text.c_str());
+  uint32_t cp = 0;
+  uint32_t nextCp = 0;
+  while ((nextCp = utf8NextCodepoint(&ptr))) {
+    cp = nextCp;
+  }
+  return cp;
+}
+
+int getNaturalGapAdvance(const GfxRenderer& renderer, const int fontId, const std::string& leftWord,
+                         const std::string& rightWord, const bool rightContinues,
+                         const EpdFontFamily::Style style) {
+  const uint32_t leftCp = lastCodepoint(leftWord);
+  const uint32_t rightCp = firstCodepoint(rightWord);
+  if (leftCp == 0 || rightCp == 0) {
+    return rightContinues ? 0 : renderer.getSpaceWidth(fontId, style);
+  }
+
+  return rightContinues ? renderer.getKerning(fontId, leftCp, rightCp, style)
+                        : renderer.getSpaceAdvance(fontId, leftCp, rightCp, style);
+}
+
 // Knuth-Plass: Calculate badness (looseness) of a line
 // Returns cubic ratio penalty - loose lines are penalized more heavily
 float calculateBadness(int lineWidth, int targetWidth) {
@@ -250,7 +282,6 @@ bool ParsedText::layoutAndExtractLines(const GfxRenderer& renderer, const int fo
   }
 
   const int pageWidth = viewportWidth;
-  const int spaceWidth = renderer.getSpaceWidth(fontId);
   const int firstLineIndentWidth = getFirstLineIndentWidth(renderer, fontId);
 
   // Rejoin words that were split by a previous interrupted greedy layout pass.
@@ -286,8 +317,8 @@ bool ParsedText::layoutAndExtractLines(const GfxRenderer& renderer, const int fo
   auto wordWidths = calculateWordWidths(renderer, fontId);
   const auto lineBreakIndices =
       useGreedyBreaking
-          ? computeLineBreaksGreedy(renderer, fontId, pageWidth, spaceWidth, wordWidths, shouldAbort)
-          : computeLineBreaks(pageWidth, spaceWidth, firstLineIndentWidth, wordWidths, shouldAbort);
+          ? computeLineBreaksGreedy(renderer, fontId, pageWidth, wordWidths, shouldAbort)
+          : computeLineBreaks(renderer, fontId, pageWidth, firstLineIndentWidth, wordWidths, shouldAbort);
 
   // Check if we were aborted during line break computation
   if (shouldAbort && shouldAbort()) {
@@ -300,7 +331,7 @@ bool ParsedText::layoutAndExtractLines(const GfxRenderer& renderer, const int fo
     if (shouldAbort && shouldAbort()) {
       return false;
     }
-    extractLine(i, pageWidth, spaceWidth, firstLineIndentWidth, wordWidths, lineBreakIndices, processLine);
+    extractLine(i, pageWidth, firstLineIndentWidth, wordWidths, lineBreakIndices, processLine, renderer, fontId);
   }
   return true;
 }
@@ -311,7 +342,7 @@ int ParsedText::getFirstLineIndentWidth(const GfxRenderer& renderer, const int f
   }
 
   const EpdFontFamily::Style firstWordStyle = wordStyles.empty() ? EpdFontFamily::REGULAR : wordStyles.front();
-  const int spaceWidth = renderer.getTextWidth(fontId, " ", firstWordStyle);
+  const int spaceWidth = renderer.getSpaceWidth(fontId, firstWordStyle);
   if (spaceWidth <= 0) return 0;
 
   switch (indentLevel) {
@@ -338,7 +369,7 @@ std::vector<uint16_t> ParsedText::calculateWordWidths(const GfxRenderer& rendere
     // After preSplitOversizedWords, words shouldn't contain soft hyphens,
     // but we strip here for safety and for when hyphenation is disabled
     std::string displayWord = stripSoftHyphens(*wordsIt);
-    wordWidths.push_back(renderer.getTextWidth(fontId, displayWord.c_str(), *wordStylesIt));
+    wordWidths.push_back(renderer.getTextAdvanceX(fontId, displayWord.c_str(), *wordStylesIt));
     // Update the word in the list with the stripped version for rendering
     *wordsIt = std::move(displayWord);
 
@@ -349,7 +380,7 @@ std::vector<uint16_t> ParsedText::calculateWordWidths(const GfxRenderer& rendere
   return wordWidths;
 }
 
-std::vector<size_t> ParsedText::computeLineBreaks(const int pageWidth, const int spaceWidth,
+std::vector<size_t> ParsedText::computeLineBreaks(const GfxRenderer& renderer, const int fontId, const int pageWidth,
                                                   const int firstLineIndentWidth,
                                                   const std::vector<uint16_t>& wordWidths,
                                                   const AbortCallback& shouldAbort) const {
@@ -375,7 +406,11 @@ std::vector<size_t> ParsedText::computeLineBreaks(const int pageWidth, const int
     const int effectivePageWidth = std::max(1, (i == 0) ? pageWidth - firstLineIndentWidth : pageWidth);
     int lineWidth = 0;
     for (size_t j = i; j < n; j++) {
-      const int gapBefore = (j > i && !wordContinues[j]) ? spaceWidth : 0;
+      int gapBefore = 0;
+      if (j > i) {
+        gapBefore =
+            getNaturalGapAdvance(renderer, fontId, words[j - 1], words[j], wordContinues[j], wordStyles[j - 1]);
+      }
       lineWidth += gapBefore + wordWidths[j];
 
       if (lineWidth > effectivePageWidth) {
@@ -429,8 +464,7 @@ std::vector<size_t> ParsedText::computeLineBreaks(const int pageWidth, const int
 }
 
 std::vector<size_t> ParsedText::computeLineBreaksGreedy(const GfxRenderer& renderer, const int fontId,
-                                                        const int pageWidth, const int spaceWidth,
-                                                        std::vector<uint16_t>& wordWidths,
+                                                        const int pageWidth, std::vector<uint16_t>& wordWidths,
                                                         const AbortCallback& shouldAbort) {
   std::vector<size_t> breaks;
   size_t n = wordWidths.size();
@@ -451,7 +485,10 @@ std::vector<size_t> ParsedText::computeLineBreaksGreedy(const GfxRenderer& rende
     }
 
     const int wordWidth = wordWidths[i];
-    const int gapBefore = (lineWidth > 0 && !wordContinues[i]) ? spaceWidth : 0;
+    const int gapBefore =
+        (lineWidth > 0 && i > 0)
+            ? getNaturalGapAdvance(renderer, fontId, words[i - 1], words[i], wordContinues[i], wordStyles[i - 1])
+            : 0;
 
     // Check if adding this word would overflow the line.
     // Continuation words (attaching punctuation etc.) are never allowed to start a new
@@ -488,51 +525,103 @@ std::vector<size_t> ParsedText::computeLineBreaksGreedy(const GfxRenderer& rende
   return breaks;
 }
 
-void ParsedText::extractLine(const size_t breakIndex, const int pageWidth, const int spaceWidth,
-                             const int firstLineIndentWidth, const std::vector<uint16_t>& wordWidths,
+void ParsedText::extractLine(const size_t breakIndex, const int pageWidth, const int firstLineIndentWidth,
+                             const std::vector<uint16_t>& wordWidths,
                              const std::vector<size_t>& lineBreakIndices,
-                             const std::function<void(std::shared_ptr<TextBlock>)>& processLine) {
+                             const std::function<void(std::shared_ptr<TextBlock>)>& processLine,
+                             const GfxRenderer& renderer, const int fontId) {
   const size_t lineBreak = lineBreakIndices[breakIndex];
   const size_t lastBreakAt = breakIndex > 0 ? lineBreakIndices[breakIndex - 1] : 0;
   const size_t lineWordCount = lineBreak - lastBreakAt;
   const int lineIndent = (breakIndex == 0 && !isRtl && style != TextBlock::CENTER_ALIGN) ? firstLineIndentWidth : 0;
 
-  // Calculate total word width for this line and count actual word gaps
-  // (continuation words that attach to previous don't count as a gap)
+  // Calculate line width from measured words plus the natural gap between each
+  // adjacent pair. Continuation words contribute cross-boundary kerning only.
   int lineWordWidthSum = 0;
   size_t actualGapCount = 0;
-  auto countContinuesIt = wordContinues.begin();
+  int totalNaturalGaps = 0;
 
   for (size_t wordIdx = 0; wordIdx < lineWordCount; wordIdx++) {
     lineWordWidthSum += wordWidths[lastBreakAt + wordIdx];
-    // Count gaps: each word after the first creates a gap, unless it continues the previous
-    if (wordIdx > 0 && !(*countContinuesIt)) {
-      actualGapCount++;
+    if (wordIdx > 0) {
+      totalNaturalGaps += getNaturalGapAdvance(renderer, fontId, words[wordIdx - 1], words[wordIdx],
+                                               wordContinues[wordIdx], wordStyles[wordIdx - 1]);
+      if (!wordContinues[wordIdx]) {
+        actualGapCount++;
+      }
     }
-    ++countContinuesIt;
   }
 
-  // Calculate spacing
   const int effectivePageWidth = std::max(1, pageWidth - lineIndent);
-  const int spareSpace = effectivePageWidth - lineWordWidthSum;
-
-  int spacing = spaceWidth;
-  int spacingRemainder = 0;
   const bool isLastLine = breakIndex == lineBreakIndices.size() - 1;
-
-  // For justified text, distribute spare space evenly across gaps.
-  // The integer remainder (spareSpace % gapCount) is spread one pixel at a time
-  // to the first N gaps so the line fills exactly pageWidth.
-  if (style == TextBlock::JUSTIFIED && !isLastLine && actualGapCount >= 1) {
-    spacing = spareSpace / static_cast<int>(actualGapCount);
-    spacingRemainder = spareSpace % static_cast<int>(actualGapCount);
-  }
-
-  // For RTL text, default to right alignment
+  const int spareSpace = effectivePageWidth - lineWordWidthSum - totalNaturalGaps;
   const auto effectiveStyle = (isRtl && style == TextBlock::LEFT_ALIGN) ? TextBlock::RIGHT_ALIGN : style;
 
-  // Build WordData vector directly, consuming from front of lists
-  // Punctuation that attaches to the previous word doesn't get space before it
+  int justifyExtra = 0;
+  int justifyRemainder = 0;
+  if (effectiveStyle == TextBlock::JUSTIFIED && !isLastLine && actualGapCount >= 1) {
+    justifyExtra = spareSpace / static_cast<int>(actualGapCount);
+    justifyRemainder = spareSpace % static_cast<int>(actualGapCount);
+  }
+
+  std::vector<int> gapAfter(lineWordCount, 0);
+  int emittedGapCount = 0;
+  for (size_t wordIdx = 0; wordIdx + 1 < lineWordCount; wordIdx++) {
+    const bool nextContinues = wordContinues[wordIdx + 1];
+    int gap = getNaturalGapAdvance(renderer, fontId, words[wordIdx], words[wordIdx + 1], nextContinues,
+                                   wordStyles[wordIdx]);
+
+    if (!nextContinues && effectiveStyle == TextBlock::JUSTIFIED && !isLastLine) {
+      gap += justifyExtra;
+      if (justifyRemainder != 0 && emittedGapCount < std::abs(justifyRemainder)) {
+        gap += justifyRemainder > 0 ? 1 : -1;
+      }
+      emittedGapCount++;
+    }
+
+    gapAfter[wordIdx] = gap;
+  }
+
+  int laidOutWidth = lineWordWidthSum;
+  for (size_t wordIdx = 0; wordIdx + 1 < lineWordCount; wordIdx++) {
+    laidOutWidth += gapAfter[wordIdx];
+  }
+  const int remainingSpace = effectivePageWidth - laidOutWidth;
+
+  std::vector<int> lineXPos;
+  lineXPos.reserve(lineWordCount);
+
+  if (isRtl) {
+    int rightEdge = pageWidth;
+    if (effectiveStyle == TextBlock::CENTER_ALIGN) {
+      rightEdge = lineIndent + effectivePageWidth - remainingSpace / 2;
+    }
+
+    int xpos = rightEdge;
+    for (size_t wordIdx = 0; wordIdx < lineWordCount; wordIdx++) {
+      xpos -= wordWidths[lastBreakAt + wordIdx];
+      lineXPos.push_back(xpos);
+      if (wordIdx + 1 < lineWordCount) {
+        xpos -= gapAfter[wordIdx];
+      }
+    }
+  } else {
+    int xpos = lineIndent;
+    if (effectiveStyle == TextBlock::RIGHT_ALIGN) {
+      xpos = lineIndent + remainingSpace;
+    } else if (effectiveStyle == TextBlock::CENTER_ALIGN) {
+      xpos = lineIndent + remainingSpace / 2;
+    }
+
+    for (size_t wordIdx = 0; wordIdx < lineWordCount; wordIdx++) {
+      lineXPos.push_back(xpos);
+      xpos += wordWidths[lastBreakAt + wordIdx];
+      if (wordIdx + 1 < lineWordCount) {
+        xpos += gapAfter[wordIdx];
+      }
+    }
+  }
+
   std::vector<TextBlock::WordData> lineData;
   lineData.reserve(lineWordCount);
 
@@ -540,58 +629,12 @@ void ParsedText::extractLine(const size_t breakIndex, const int pageWidth, const
   auto styleIt = wordStyles.begin();
   auto continuesIt = wordContinues.begin();
 
-  if (isRtl) {
-    // RTL: Position words from right to left
-    uint16_t xpos;
-    if (effectiveStyle == TextBlock::CENTER_ALIGN) {
-      xpos = pageWidth - (spareSpace - static_cast<int>(actualGapCount) * spacing) / 2;
-    } else {
-      xpos = pageWidth;  // RIGHT_ALIGN and JUSTIFIED start from right edge
-    }
-
-    for (size_t wordIdx = 0; wordIdx < lineWordCount; wordIdx++) {
-      const uint16_t currentWordWidth = wordWidths[lastBreakAt + wordIdx];
-      xpos -= currentWordWidth;
-      lineData.push_back({replaceTrailingSoftHyphen(std::move(*wordIt)), xpos, *styleIt});
-
-      auto nextContinuesIt = continuesIt;
-      ++nextContinuesIt;
-      const bool nextContinues = wordIdx + 1 < lineWordCount && *nextContinuesIt;
-      xpos -= (nextContinues ? 0 : spacing);
-      ++wordIt;
-      ++styleIt;
-      ++continuesIt;
-    }
-  } else {
-    // LTR: Position words from left to right
-    uint16_t xpos = lineIndent;
-    if (effectiveStyle == TextBlock::RIGHT_ALIGN) {
-      xpos = lineIndent + spareSpace - static_cast<int>(actualGapCount) * spaceWidth;
-    } else if (effectiveStyle == TextBlock::CENTER_ALIGN) {
-      xpos = (spareSpace - static_cast<int>(actualGapCount) * spaceWidth) / 2;
-    }
-
-    int gapsEmitted = 0;
-    for (size_t wordIdx = 0; wordIdx < lineWordCount; wordIdx++) {
-      const uint16_t currentWordWidth = wordWidths[lastBreakAt + wordIdx];
-      lineData.push_back({replaceTrailingSoftHyphen(std::move(*wordIt)), xpos, *styleIt});
-
-      auto nextContinuesIt = continuesIt;
-      ++nextContinuesIt;
-      const bool nextContinues = wordIdx + 1 < lineWordCount && *nextContinuesIt;
-      if (!nextContinues) {
-        // Distribute remainder pixels one-by-one to the first N gaps so the
-        // line fills exactly pageWidth for justified text.
-        const int gap = spacing + (gapsEmitted < spacingRemainder ? 1 : 0);
-        xpos += currentWordWidth + gap;
-        gapsEmitted++;
-      } else {
-        xpos += currentWordWidth;
-      }
-      ++wordIt;
-      ++styleIt;
-      ++continuesIt;
-    }
+  for (size_t wordIdx = 0; wordIdx < lineWordCount; wordIdx++) {
+    const uint16_t xPos = static_cast<uint16_t>(std::max(0, lineXPos[wordIdx]));
+    lineData.push_back({replaceTrailingSoftHyphen(std::move(*wordIt)), xPos, *styleIt});
+    ++wordIt;
+    ++styleIt;
+    ++continuesIt;
   }
 
   // Remove consumed elements from all three parallel lists

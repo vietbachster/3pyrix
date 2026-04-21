@@ -4,6 +4,7 @@
 #include <EpdFontFamily.h>
 
 #include <array>
+#include <cstring>
 #include <map>
 #include <string>
 #include <vector>
@@ -128,7 +129,10 @@ class GfxRenderer {
     memset(widthCacheKeys_, 0, sizeof(widthCacheKeys_));
     widthCacheCount_ = 0;
   }
-  void setExternalFont(ExternalFont* font) { _externalFont = font; }
+  void setExternalFont(ExternalFont* font) {
+    _externalFont = font;
+    clearWidthCache();
+  }
   ExternalFont* getExternalFont() const { return _externalFont; }
   void excludeExternalFont(int fontId) {
     if (_externalFontExcludedCount < static_cast<int>(MAX_EXCLUDED_FONT_IDS))
@@ -147,14 +151,22 @@ class GfxRenderer {
     auto it = fontMap.find(fontId);
     if (it != fontMap.end()) {
       it->second.setFont(style, font);
+      clearWidthCache();
     }
   }
 
   void setStreamingFont(int fontId, EpdFontFamily::Style style, StreamingEpdFont* font) {
     _streamingFonts[fontId][EpdFontFamily::externalStyleIndex(style)] = font;
+    clearWidthCache();
   }
-  void setStreamingFont(int fontId, StreamingEpdFont* font) { _streamingFonts[fontId][EpdFontFamily::REGULAR] = font; }
-  void removeStreamingFont(int fontId) { _streamingFonts.erase(fontId); }
+  void setStreamingFont(int fontId, StreamingEpdFont* font) {
+    _streamingFonts[fontId][EpdFontFamily::REGULAR] = font;
+    clearWidthCache();
+  }
+  void removeStreamingFont(int fontId) {
+    _streamingFonts.erase(fontId);
+    clearWidthCache();
+  }
   // NOTE: May trigger lazy font loading (SD I/O + allocation) on first access to bold/italic.
   // Thread safety: caller must have exclusive renderer access (ownership model).
   StreamingEpdFont* getStreamingFont(int fontId, EpdFontFamily::Style style = EpdFontFamily::REGULAR) const {
@@ -201,7 +213,12 @@ class GfxRenderer {
                         EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;
   void drawText(int fontId, int x, int y, const char* text, bool black = true,
                 EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;
-  int getSpaceWidth(int fontId) const;
+  int getSpaceWidth(int fontId, EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;
+  int getSpaceAdvance(int fontId, uint32_t leftCp, uint32_t rightCp,
+                      EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;
+  int getKerning(int fontId, uint32_t leftCp, uint32_t rightCp,
+                 EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;
+  int getTextAdvanceX(int fontId, const char* text, EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;
   int getFontAscenderSize(int fontId) const;
   int getLineHeight(int fontId) const;
   int getEffectiveLineHeight(int fontId) const;

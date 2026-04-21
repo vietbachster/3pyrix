@@ -7,6 +7,34 @@
 
 #include "EpdFontLoader.h"
 
+namespace {
+
+size_t tableMemoryUsage(const EpdFontData& fontData) {
+  const size_t kernEntries =
+      static_cast<size_t>(fontData.kernLeftEntryCount + fontData.kernRightEntryCount) * sizeof(EpdKernClassEntry);
+  const size_t kernMatrix = static_cast<size_t>(fontData.kernLeftClassCount) * fontData.kernRightClassCount;
+  const size_t ligatures = static_cast<size_t>(fontData.ligaturePairCount) * sizeof(EpdLigaturePair);
+  return kernEntries + kernMatrix + ligatures;
+}
+
+void freeOwnedTables(EpdFontData& fontData) {
+  delete[] fontData.kernLeftClasses;
+  delete[] fontData.kernRightClasses;
+  delete[] fontData.kernMatrix;
+  delete[] fontData.ligaturePairs;
+  fontData.kernLeftClasses = nullptr;
+  fontData.kernRightClasses = nullptr;
+  fontData.kernMatrix = nullptr;
+  fontData.kernLeftEntryCount = 0;
+  fontData.kernRightEntryCount = 0;
+  fontData.kernLeftClassCount = 0;
+  fontData.kernRightClassCount = 0;
+  fontData.ligaturePairs = nullptr;
+  fontData.ligaturePairCount = 0;
+}
+
+}  // namespace
+
 StreamingEpdFont::StreamingEpdFont() {
   memset(&_fontData, 0, sizeof(_fontData));
   for (int i = 0; i < CACHE_SIZE; i++) {
@@ -33,18 +61,15 @@ bool StreamingEpdFont::load(const char* path) {
   _intervalsSize = result.intervalsSize;
   _bitmapOffset = result.bitmapOffset;
 
-  // Copy font metadata
+  // Copy font metadata, including owned kerning / ligature tables.
+  _fontData = result.fontData;
   _fontData.bitmap = nullptr;  // No bitmap in RAM - we stream it
   _fontData.glyph = _glyphs;
   _fontData.intervals = _intervals;
-  _fontData.intervalCount = result.fontData.intervalCount;
-  _fontData.advanceY = result.fontData.advanceY;
-  _fontData.ascender = result.fontData.ascender;
-  _fontData.descender = result.fontData.descender;
-  _fontData.is2Bit = result.fontData.is2Bit;
 
   // Open file and keep it open for streaming
   if (!SdMan.openFileForRead("SFONT", path, _fontFile)) {
+    freeOwnedTables(_fontData);
     delete[] _glyphs;
     delete[] _intervals;
     _glyphs = nullptr;
@@ -61,6 +86,7 @@ void StreamingEpdFont::unload() {
     _fontFile.close();
   }
 
+  freeOwnedTables(_fontData);
   delete[] _glyphs;
   delete[] _intervals;
 
@@ -373,6 +399,7 @@ size_t StreamingEpdFont::getMemoryUsage() const {
   size_t usage = sizeof(StreamingEpdFont);
   usage += _glyphsSize;
   usage += _intervalsSize;
+  usage += tableMemoryUsage(_fontData);
   usage += _totalCacheAllocation;
   return usage;
 }
