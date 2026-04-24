@@ -25,6 +25,46 @@ namespace papyrix {
 
 namespace {
 
+bool naturalNameLess(const std::string& lhs, const std::string& rhs) {
+  const char* s1 = lhs.c_str();
+  const char* s2 = rhs.c_str();
+
+  while (*s1 && *s2) {
+    const auto uc = [](char c) { return static_cast<unsigned char>(c); };
+    if (std::isdigit(uc(*s1)) && std::isdigit(uc(*s2))) {
+      // Skip leading zeros
+      while (*s1 == '0') s1++;
+      while (*s2 == '0') s2++;
+
+      // Compare by digit length first
+      int len1 = 0;
+      int len2 = 0;
+      while (std::isdigit(uc(s1[len1]))) len1++;
+      while (std::isdigit(uc(s2[len2]))) len2++;
+      if (len1 != len2) return len1 < len2;
+
+      // Same length: compare digit by digit
+      for (int i = 0; i < len1; i++) {
+        if (s1[i] != s2[i]) return s1[i] < s2[i];
+      }
+      s1 += len1;
+      s2 += len2;
+    } else {
+      char c1 = std::tolower(uc(*s1));
+      char c2 = std::tolower(uc(*s2));
+      if (c1 != c2) return c1 < c2;
+      s1++;
+      s2++;
+    }
+  }
+
+  return *s1 == '\0' && *s2 != '\0';
+}
+
+uint32_t packModifyTimestamp(uint16_t date, uint16_t time) {
+  return (static_cast<uint32_t>(date) << 16) | time;
+}
+
 bool directoryExists(drivers::Storage& storage, const char* path) {
   FsFile dir;
   auto result = storage.openDir(path, dir);
@@ -168,10 +208,13 @@ void FileListState::loadFiles(Core& core) {
     }
 
     bool isDir = entry.isDirectory();
+    uint16_t modifyDate = 0;
+    uint16_t modifyTime = 0;
+    const bool hasModifyTimestamp = entry.getModifyDateTime(&modifyDate, &modifyTime);
     entry.close();
 
     if (isDir || isSupportedFile(name)) {
-      files_.push_back({std::string(name), isDir});
+      files_.push_back({std::string(name), isDir, modifyDate, modifyTime, hasModifyTimestamp});
     }
   }
   dir.close();
@@ -184,42 +227,18 @@ void FileListState::loadFiles(Core& core) {
     files_.shrink_to_fit();
   }
 
-  // Sort: directories first, then natural sort (case-insensitive)
+  // Sort: directories first, then oldest-to-newest modify time, then natural sort.
   std::sort(files_.begin(), files_.end(), [](const FileEntry& a, const FileEntry& b) {
     if (a.isDir && !b.isDir) return true;
     if (!a.isDir && b.isDir) return false;
 
-    const char* s1 = a.name.c_str();
-    const char* s2 = b.name.c_str();
-
-    while (*s1 && *s2) {
-      const auto uc = [](char c) { return static_cast<unsigned char>(c); };
-      if (std::isdigit(uc(*s1)) && std::isdigit(uc(*s2))) {
-        // Skip leading zeros
-        while (*s1 == '0') s1++;
-        while (*s2 == '0') s2++;
-
-        // Compare by digit length first
-        int len1 = 0, len2 = 0;
-        while (std::isdigit(uc(s1[len1]))) len1++;
-        while (std::isdigit(uc(s2[len2]))) len2++;
-        if (len1 != len2) return len1 < len2;
-
-        // Same length: compare digit by digit
-        for (int i = 0; i < len1; i++) {
-          if (s1[i] != s2[i]) return s1[i] < s2[i];
-        }
-        s1 += len1;
-        s2 += len2;
-      } else {
-        char c1 = std::tolower(uc(*s1));
-        char c2 = std::tolower(uc(*s2));
-        if (c1 != c2) return c1 < c2;
-        s1++;
-        s2++;
-      }
+    if (a.hasModifyTimestamp && b.hasModifyTimestamp) {
+      const uint32_t aTimestamp = packModifyTimestamp(a.modifyDate, a.modifyTime);
+      const uint32_t bTimestamp = packModifyTimestamp(b.modifyDate, b.modifyTime);
+      if (aTimestamp != bTimestamp) return aTimestamp < bTimestamp;
     }
-    return *s1 == '\0' && *s2 != '\0';
+
+    return naturalNameLess(a.name, b.name);
   });
 
   // Release excess capacity reserved during collection

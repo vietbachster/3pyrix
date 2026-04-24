@@ -45,6 +45,9 @@ class FileListState : public State {
   struct FileEntry {
     std::string name;
     bool isDir;
+    uint16_t modifyDate;
+    uint16_t modifyTime;
+    bool hasModifyTimestamp;
   };
   std::vector<FileEntry> files_;
 
