@@ -33,6 +33,7 @@ class PageCache {
   RenderConfig config_;
   uint32_t lutOffset_ = 0;  // Cached LUT offset for extend operations
 
+  void resetState();
   bool writeHeader(bool isPartial);
   bool writeLut(const std::vector<uint32_t>& lut);
   bool loadLut(std::vector<uint32_t>& lut);  // Load existing LUT for extend
@@ -88,11 +89,13 @@ class PageCache {
    * Clear cache from disk.
    * @return true on success
    */
-  bool clear() const;
+  bool clear();
 
   // Accessors
   uint16_t pageCount() const { return pageCount_; }
   bool isPartial() const { return isPartial_; }
-  bool needsExtension(uint16_t currentPage) const { return isPartial_ && currentPage >= pageCount_ - EXTEND_THRESHOLD; }
+  bool needsExtension(uint16_t currentPage) const {
+    return isPartial_ && pageCount_ > 0 && currentPage + EXTEND_THRESHOLD >= pageCount_;
+  }
   const std::string& path() const { return cachePath_; }
 };
