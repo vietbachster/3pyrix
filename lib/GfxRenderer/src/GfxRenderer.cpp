@@ -5,6 +5,14 @@
 #include <StreamingEpdFont.h>
 #include <Utf8.h>
 
+#if __has_include(<esp_attr.h>)
+#include <esp_attr.h>
+#endif
+#ifndef IRAM_ATTR
+#define IRAM_ATTR
+#endif
+
+#include <algorithm>
 #include <cassert>
 
 #define TAG "GFX"
@@ -269,8 +277,72 @@ void GfxRenderer::drawCenteredText(const int fontId, const int y, const char* te
   drawText(fontId, x, y, text, black, style);
 }
 
-void GfxRenderer::drawText(const int fontId, const int x, const int y, const char* text, const bool black,
-                           const EpdFontFamily::Style style) const {
+IRAM_ATTR void GfxRenderer::warmTextGlyphs(const int fontId, const char* text, const EpdFontFamily::Style style) const {
+  if (!text || !*text) return;
+
+  auto it = fontMap.find(fontId);
+  if (it == fontMap.end()) {
+    return;
+  }
+
+  if (style != EpdFontFamily::REGULAR) {
+    getStreamingFont(fontId, style);
+  }
+
+  const auto& font = it->second;
+  std::vector<uint32_t> codepoints;
+  codepoints.reserve(strlen(text));
+
+  const char* ptr = text;
+  uint32_t cp;
+  while ((cp = utf8NextCodepoint(reinterpret_cast<const uint8_t**>(&ptr)))) {
+    if (!utf8IsCombiningMark(cp)) {
+      cp = font.applyLigatures(cp, ptr, style);
+    }
+    codepoints.push_back(cp);
+  }
+
+  if (codepoints.empty()) {
+    return;
+  }
+
+  std::sort(codepoints.begin(), codepoints.end());
+  codepoints.erase(std::unique(codepoints.begin(), codepoints.end()), codepoints.end());
+  warmCodepointsBatch(fontId, codepoints.data(), codepoints.size(), style);
+}
+
+IRAM_ATTR void GfxRenderer::warmCodepointsBatch(const int fontId, const uint32_t* codepoints, const size_t count,
+                                                const EpdFontFamily::Style style) const {
+  if (!codepoints || count == 0) return;
+
+  StreamingEpdFont* streamingFont = getStreamingFont(fontId, style);
+  if (streamingFont) {
+    for (size_t i = 0; i < count; i++) {
+      const EpdGlyph* glyph = streamingFont->getGlyph(codepoints[i]);
+      if (glyph) {
+        streamingFont->getGlyphBitmap(glyph);
+      }
+    }
+  }
+
+  size_t firstExternal = 0;
+  while (firstExternal < count && codepoints[firstExternal] < 0x80) {
+    firstExternal++;
+  }
+
+  if (firstExternal >= count || !isExternalFontAllowed(fontId)) {
+    return;
+  }
+
+  const bool externalAvailable =
+      (_externalFont && _externalFont->isLoaded()) || tryResolveExternalFont();
+  if (externalAvailable) {
+    _externalFont->preloadGlyphs(&codepoints[firstExternal], count - firstExternal);
+  }
+}
+
+IRAM_ATTR void GfxRenderer::drawText(const int fontId, const int x, const int y, const char* text, const bool black,
+                                     const EpdFontFamily::Style style) const {
   // cannot draw a NULL / empty string
   if (text == nullptr || *text == '\0') {
     return;
@@ -843,7 +915,8 @@ int GfxRenderer::getKerning(const int fontId, const uint32_t leftCp, const uint3
   return it->second.getKerning(leftCp, rightCp, style);
 }
 
-int GfxRenderer::getTextAdvanceX(const int fontId, const char* text, const EpdFontFamily::Style style) const {
+IRAM_ATTR int GfxRenderer::getTextAdvanceX(const int fontId, const char* text,
+                                           const EpdFontFamily::Style style) const {
   if (!text || !*text) return 0;
 
   auto it = fontMap.find(fontId);
@@ -1172,8 +1245,9 @@ static void renderGlyphPixels(const GfxRenderer& renderer, const uint8_t* bitmap
   }
 }
 
-void GfxRenderer::renderChar(const EpdFontFamily& fontFamily, const uint32_t cp, int* x, const int* y,
-                             const bool pixelState, const EpdFontFamily::Style style, const int fontId) const {
+IRAM_ATTR void GfxRenderer::renderChar(const EpdFontFamily& fontFamily, const uint32_t cp, int* x, const int* y,
+                                       const bool pixelState, const EpdFontFamily::Style style,
+                                       const int fontId) const {
   // Try external font first — covers CJK and optionally Latin from .bin fonts
   if (isExternalFontAllowed(fontId) && (_externalFont || tryResolveExternalFont()) && _externalFont->isLoaded()) {
     const uint8_t* extBitmap = _externalFont->getGlyph(cp);
@@ -1295,8 +1369,8 @@ void GfxRenderer::freeBitmapRowBuffers() {
   }
 }
 
-void GfxRenderer::renderExternalGlyph(const uint32_t cp, int* x, const int y, const bool pixelState,
-                                      const uint8_t* bitmap) const {
+IRAM_ATTR void GfxRenderer::renderExternalGlyph(const uint32_t cp, int* x, const int y, const bool pixelState,
+                                                const uint8_t* bitmap) const {
   if (!_externalFont || !_externalFont->isLoaded()) {
     return;
   }

@@ -211,6 +211,9 @@ class GfxRenderer {
                      EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;
   void drawCenteredText(int fontId, int y, const char* text, bool black = true,
                         EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;
+  void warmTextGlyphs(int fontId, const char* text, EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;
+  void warmCodepointsBatch(int fontId, const uint32_t* codepoints, size_t count,
+                           EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;
   void drawText(int fontId, int x, int y, const char* text, bool black = true,
                 EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;
   int getSpaceWidth(int fontId, EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;

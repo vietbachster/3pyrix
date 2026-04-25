@@ -1180,6 +1180,7 @@ void ReaderState::renderCachedPage(Core& core) {
   }
 
   const int fontId = core.settings.getReaderFontId(theme);
+  page->warmGlyphs(renderer_, fontId);
 
   renderPageContents(core, *page, vp.marginTop, vp.marginRight, vp.marginBottom, vp.marginLeft);
 
