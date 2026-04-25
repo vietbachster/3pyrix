@@ -5,6 +5,7 @@
 #include <InputManager.h>
 #include <LittleFS.h>  // Must be before SdFat includes to avoid FILE_READ/FILE_WRITE redefinition
 #include <SDCardManager.h>
+#include <SharedSpiLock.h>
 #include <SPI.h>
 #include <Wire.h>
 #include <builtinFonts/reader_2b.h>
@@ -274,7 +275,10 @@ bool earlyInit() {
   Wire.setTimeOut(4);
 
   // Initialize SPI and SD card before wakeup verification so settings are available
-  SPI.begin(EPD_SCLK, SD_SPI_MISO, EPD_MOSI, EPD_CS);
+  {
+    papyrix::spi::SharedBusLock lk;
+    SPI.begin(EPD_SCLK, SD_SPI_MISO, EPD_MOSI, EPD_CS);
+  }
   if (!SdMan.begin()) {
     LOG_ERR(TAG, "SD card initialization failed");
     setupDisplayAndFonts();

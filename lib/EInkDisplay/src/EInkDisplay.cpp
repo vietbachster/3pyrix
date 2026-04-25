@@ -1,5 +1,7 @@
 #include "EInkDisplay.h"
 
+#include <SharedSpiLock.h>
+
 #include <cstring>
 #include <fstream>
 #include <vector>
@@ -121,7 +123,10 @@ void EInkDisplay::begin() {
   inGrayscaleMode = false;
   isScreenOn = false;
 
-  SPI.begin(_sclk, -1, _mosi, _cs);
+  {
+    papyrix::spi::SharedBusLock busLock;
+    SPI.begin(_sclk, -1, _mosi, _cs);
+  }
   spiSettings = SPISettings(10000000, MSBFIRST, SPI_MODE0);
 
   pinMode(_cs, OUTPUT);
@@ -146,6 +151,8 @@ void EInkDisplay::resetDisplay() {
 }
 
 void EInkDisplay::sendCommand(uint8_t command) {
+  papyrix::spi::SharedBusLock busLock;
+  if (!busLock) return;
   SPI.beginTransaction(spiSettings);
   digitalWrite(_dc, LOW);
   digitalWrite(_cs, LOW);
@@ -155,6 +162,8 @@ void EInkDisplay::sendCommand(uint8_t command) {
 }
 
 void EInkDisplay::sendData(uint8_t data) {
+  papyrix::spi::SharedBusLock busLock;
+  if (!busLock) return;
   SPI.beginTransaction(spiSettings);
   digitalWrite(_dc, HIGH);
   digitalWrite(_cs, LOW);
@@ -164,6 +173,8 @@ void EInkDisplay::sendData(uint8_t data) {
 }
 
 void EInkDisplay::sendData(const uint8_t* data, uint16_t length) {
+  papyrix::spi::SharedBusLock busLock;
+  if (!busLock) return;
   SPI.beginTransaction(spiSettings);
   digitalWrite(_dc, HIGH);
   digitalWrite(_cs, LOW);
@@ -173,6 +184,8 @@ void EInkDisplay::sendData(const uint8_t* data, uint16_t length) {
 }
 
 void EInkDisplay::sendCommandData(uint8_t command, const uint8_t* data, uint16_t length) {
+  papyrix::spi::SharedBusLock busLock;
+  if (!busLock) return;
   SPI.beginTransaction(spiSettings);
   digitalWrite(_cs, LOW);
   digitalWrite(_dc, LOW);

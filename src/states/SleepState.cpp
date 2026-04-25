@@ -11,6 +11,7 @@
 #include <LittleFS.h>
 #include <Logging.h>
 #include <SDCardManager.h>
+#include <SharedSpiLock.h>
 #include <SPI.h>
 #include <Txt.h>
 #include <Xtc.h>
@@ -77,7 +78,10 @@ void SleepState::enter(Core& core) {
   // Power down peripherals before deep sleep to minimize current draw
   SdMan.end();
   LittleFS.end();
-  SPI.end();
+  {
+    papyrix::spi::SharedBusLock lk;
+    SPI.end();
+  }
 
   // Configure wake-up source (power button)
   esp_deep_sleep_enable_gpio_wakeup(1ULL << InputManager::POWER_BUTTON_PIN, ESP_GPIO_WAKEUP_GPIO_LOW);

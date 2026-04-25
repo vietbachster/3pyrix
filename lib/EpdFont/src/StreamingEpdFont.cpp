@@ -1,5 +1,6 @@
 #include "StreamingEpdFont.h"
 
+#include <SharedSpiLock.h>
 #include <Utf8.h>
 
 #include <algorithm>
@@ -83,6 +84,7 @@ bool StreamingEpdFont::load(const char* path) {
 
 void StreamingEpdFont::unload() {
   if (_fontFile) {
+    papyrix::spi::SharedBusLock busLock;
     _fontFile.close();
   }
 
@@ -235,6 +237,7 @@ bool StreamingEpdFont::loadGlyphBitmap(uint32_t glyphIndex, CachedBitmap& entry)
   uint32_t filePos = _bitmapOffset + glyph.dataOffset;
   for (int attempt = 0; attempt < 3; attempt++) {
     if (attempt > 0) delay(50);
+    papyrix::spi::SharedBusLock busLock;
     if (!_fontFile.seek(filePos)) continue;
     if (_fontFile.read(entry.bitmap, dataLen) == dataLen) return true;
   }

@@ -1,0 +1,14 @@
+{
+  "name": "SharedSpi",
+  "version": "1.0.0",
+  "description": "Shared recursive SPI bus lock helpers",
+  "platforms": "espressif32",
+  "frameworks": [
+    "arduino",
+    "espidf"
+  ],
+  "build": {
+    "srcDir": "src",
+    "includeDir": "include"
+  }
+}

@@ -1,6 +1,7 @@
 #include "SDCardManager.h"
 
 #include <Logging.h>
+#include <SharedSpiLock.h>
 
 #include <vector>
 
@@ -16,6 +17,7 @@ SDCardManager SDCardManager::instance;
 SDCardManager::SDCardManager() : sd() {}
 
 bool SDCardManager::begin() {
+  papyrix::spi::SharedBusLock lk;
   if (!sd.begin(SD_CS, SPI_FQ)) {
     LOG_ERR(TAG, "SD card not detected");
     initialized = false;
@@ -29,6 +31,7 @@ bool SDCardManager::begin() {
 
 void SDCardManager::end() {
   if (initialized) {
+    papyrix::spi::SharedBusLock lk;
     sd.end();
     initialized = false;
   }
@@ -43,6 +46,7 @@ std::vector<String> SDCardManager::listFiles(const char* path, const int maxFile
     return ret;
   }
 
+  papyrix::spi::SharedBusLock lk;
   auto root = sd.open(path);
   if (!root) {
     LOG_ERR(TAG, "Failed to open directory");
@@ -80,6 +84,7 @@ String SDCardManager::readFile(const char* path) {
     return {""};
   }
 
+  papyrix::spi::SharedBusLock lk;
   FsFile f;
   if (!openFileForRead("SD", path, f)) {
     return {""};
@@ -111,6 +116,7 @@ bool SDCardManager::readFileToStream(const char* path, Print& out, const size_t 
     return false;
   }
 
+  papyrix::spi::SharedBusLock lk;
   FsFile f;
   if (!openFileForRead("SD", path, f)) {
     return false;
@@ -141,6 +147,7 @@ size_t SDCardManager::readFileToBuffer(const char* path, char* buffer, const siz
     return 0;
   }
 
+  papyrix::spi::SharedBusLock lk;
   FsFile f;
   if (!openFileForRead("SD", path, f)) {
     buffer[0] = '\0';
@@ -173,6 +180,7 @@ bool SDCardManager::writeFile(const char* path, const String& content) {
     return false;
   }
 
+  papyrix::spi::SharedBusLock lk;
   // Remove existing file so we perform an overwrite rather than append
   if (sd.exists(path)) {
     sd.remove(path);
@@ -194,6 +202,7 @@ bool SDCardManager::ensureDirectoryExists(const char* path) {
     return false;
   }
 
+  papyrix::spi::SharedBusLock lk;
   // Check if directory already exists
   if (sd.exists(path)) {
     FsFile dir = sd.open(path);
@@ -214,7 +223,38 @@ bool SDCardManager::ensureDirectoryExists(const char* path) {
   }
 }
 
+FsFile SDCardManager::open(const char* path, const oflag_t oflag) {
+  papyrix::spi::SharedBusLock lk;
+  return sd.open(path, oflag);
+}
+
+bool SDCardManager::mkdir(const char* path, const bool pFlag) {
+  papyrix::spi::SharedBusLock lk;
+  return sd.mkdir(path, pFlag);
+}
+
+bool SDCardManager::exists(const char* path) {
+  papyrix::spi::SharedBusLock lk;
+  return sd.exists(path);
+}
+
+bool SDCardManager::remove(const char* path) {
+  papyrix::spi::SharedBusLock lk;
+  return sd.remove(path);
+}
+
+bool SDCardManager::rmdir(const char* path) {
+  papyrix::spi::SharedBusLock lk;
+  return sd.rmdir(path);
+}
+
+bool SDCardManager::rename(const char* path, const char* newPath) {
+  papyrix::spi::SharedBusLock lk;
+  return sd.rename(path, newPath);
+}
+
 bool SDCardManager::openFileForRead(const char* moduleName, const char* path, FsFile& file) {
+  papyrix::spi::SharedBusLock lk;
   if (!sd.exists(path)) {
     LOG_ERR(moduleName, "File does not exist: %s", path);
     return false;
@@ -237,6 +277,7 @@ bool SDCardManager::openFileForRead(const char* moduleName, const String& path, 
 }
 
 bool SDCardManager::openFileForWrite(const char* moduleName, const char* path, FsFile& file) {
+  papyrix::spi::SharedBusLock lk;
   file = sd.open(path, O_RDWR | O_CREAT | O_TRUNC);
   if (!file) {
     LOG_ERR(moduleName, "Failed to open file for writing: %s", path);
@@ -254,6 +295,7 @@ bool SDCardManager::openFileForWrite(const char* moduleName, const String& path,
 }
 
 bool SDCardManager::removeDir(const char* path) {
+  papyrix::spi::SharedBusLock lk;
   auto dir = sd.open(path);
   if (!dir) {
     return false;
