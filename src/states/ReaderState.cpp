@@ -27,6 +27,7 @@
 #include "../core/Core.h"
 #include "../ui/Elements.h"
 #include "../ui/views/ReaderViews.h"
+#include "reader/ReaderTocNavigation.h"
 #include "ThemeManager.h"
 
 #define TAG "READER"
@@ -2018,27 +2019,31 @@ int ReaderState::findCurrentTocEntry(Core& core) {
 
     return bestMatch;
   } else if (type == ContentType::Xtc) {
-    // For XTC, find chapter containing current page
     const uint16_t count = core.content.tocCount();
-    int lastMatch = -1;
+    std::vector<reader::FlatTocEntry> tocEntries;
+    tocEntries.reserve(count);
+
     for (uint16_t i = 0; i < count; i++) {
       auto result = core.content.getTocEntry(i);
-      if (result.ok() && result.value.pageIndex <= static_cast<uint32_t>(currentPage_)) {
-        lastMatch = i;
+      if (result.ok()) {
+        tocEntries.push_back({static_cast<int>(i), result.value.pageIndex});
       }
     }
-    return lastMatch;
+
+    return reader::findFlatTocEntryForPage(tocEntries, static_cast<uint32_t>(currentPage_));
   } else if (type == ContentType::Txt) {
-    // For flat-page formats, find chapter whose pageIndex <= current section page
     const uint16_t count = core.content.tocCount();
-    int lastMatch = -1;
+    std::vector<reader::FlatTocEntry> tocEntries;
+    tocEntries.reserve(count);
+
     for (uint16_t i = 0; i < count; i++) {
       auto result = core.content.getTocEntry(i);
-      if (result.ok() && result.value.pageIndex <= static_cast<uint32_t>(currentSectionPage_)) {
-        lastMatch = i;
+      if (result.ok()) {
+        tocEntries.push_back({static_cast<int>(i), result.value.pageIndex});
       }
     }
-    return lastMatch;
+
+    return reader::findFlatTocEntryForPage(tocEntries, static_cast<uint32_t>(currentSectionPage_));
   }
 
   return -1;
@@ -2061,16 +2066,13 @@ void ReaderState::jumpToTocEntry(Core& core, int tocIndex) {
       return;
     }
 
-    if (static_cast<int>(chapter.pageNum) != currentSpineIndex_) {
-      // Different spine — full reset
+    const auto jumpPlan = reader::planEpubTocJump(currentSpineIndex_, chapter.pageNum);
+    if (jumpPlan.needsResourceReset) {
       // Task already stopped by enterTocMode(); caller restarts after exitTocMode()
-      currentSpineIndex_ = chapter.pageNum;
       resourceController_.clearDocumentResources();
-      currentSectionPage_ = 0;
-    } else {
-      // Same spine — navigate using anchor (default to page 0)
-      currentSectionPage_ = 0;
     }
+    currentSpineIndex_ = jumpPlan.spineIndex;
+    currentSectionPage_ = jumpPlan.sectionPage;
 
     // Try anchor-based navigation for precise positioning
     auto tocItem = epub->getTocItem(tocIndex);

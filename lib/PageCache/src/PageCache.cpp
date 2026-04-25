@@ -9,56 +9,9 @@
 #include <Serialization.h>
 
 #include "ContentParser.h"
+#include "PageCacheHeader.h"
 
 namespace {
-constexpr uint8_t CACHE_FILE_VERSION = 20;  // v20: invalidate caches after line-breaker behavior change
-constexpr uint16_t MAX_REASONABLE_PAGE_COUNT = 8192;
-
-// Header layout:
-// - version (1 byte)
-// - fontId (4 bytes)
-// - lineCompression (4 bytes)
-// - readerFontSize (1 byte)
-// - indentLevel (1 byte)
-// - spacingLevel (1 byte)
-// - paragraphAlignment (1 byte)
-// - hyphenation (1 byte)
-// - showImages (1 byte)
-// - viewportWidth (2 bytes)
-// - viewportHeight (2 bytes)
-// - pageCount (2 bytes)
-// - isPartial (1 byte)
-// - lutOffset (4 bytes)
-constexpr uint32_t HEADER_SIZE = 1 + 4 + 4 + 1 + 1 + 1 + 1 + 1 + 1 + 2 + 2 + 2 + 1 + 4;
-
-bool validateCacheIndexBounds(const char* cachePath, const size_t fileSize, const uint16_t pageCount,
-                              const uint32_t lutOffset) {
-  if (pageCount == 0) {
-    LOG_ERR(TAG, "Rejecting empty/incomplete cache file: %s", cachePath);
-    return false;
-  }
-
-  if (pageCount > MAX_REASONABLE_PAGE_COUNT) {
-    LOG_ERR(TAG, "Rejecting cache with implausible page count %u: %s", static_cast<unsigned>(pageCount), cachePath);
-    return false;
-  }
-
-  if (lutOffset < HEADER_SIZE || lutOffset >= fileSize) {
-    LOG_ERR(TAG, "Invalid lutOffset: %u (file size: %zu)", static_cast<unsigned>(lutOffset), fileSize);
-    return false;
-  }
-
-  const uint64_t lutBytes = static_cast<uint64_t>(pageCount) * sizeof(uint32_t);
-  const uint64_t lutEnd = static_cast<uint64_t>(lutOffset) + lutBytes;
-  if (lutEnd > fileSize) {
-    LOG_ERR(TAG, "Rejecting cache with truncated LUT: path=%s pages=%u lutOffset=%u fileSize=%zu", cachePath,
-            static_cast<unsigned>(pageCount), static_cast<unsigned>(lutOffset), fileSize);
-    return false;
-  }
-
-  return true;
-}
-
 bool evictCacheFile(const std::string& cachePath, const char* reason) {
   if (!SdMan.exists(cachePath.c_str())) {
     return true;
@@ -99,7 +52,7 @@ void PageCache::resetState() {
 
 bool PageCache::writeHeader(bool isPartial) {
   file_.seek(0);
-  serialization::writePod(file_, CACHE_FILE_VERSION);
+  serialization::writePod(file_, pagecache::kFileVersion);
   serialization::writePod(file_, config_.fontId);
   serialization::writePod(file_, config_.lineCompression);
   serialization::writePod(file_, config_.readerFontSize);
@@ -128,7 +81,7 @@ bool PageCache::writeLut(const std::vector<uint32_t>& lut) {
   }
 
   // Update header with final values
-  file_.seek(HEADER_SIZE - 4 - 1 - 2);  // Seek to pageCount
+  file_.seek(pagecache::kHeaderSize - 4 - 1 - 2);  // Seek to pageCount
   serialization::writePod(file_, pageCount_);
   serialization::writePod(file_, static_cast<uint8_t>(isPartial_ ? 1 : 0));
   serialization::writePod(file_, lutOffset);
@@ -143,35 +96,25 @@ bool PageCache::loadLut(std::vector<uint32_t>& lut) {
   }
 
   const size_t fileSize = file_.size();
-  if (fileSize < HEADER_SIZE) {
-    LOG_ERR(TAG, "File too small: %zu (need %u)", fileSize, HEADER_SIZE);
+  if (fileSize < pagecache::kHeaderSize) {
+    LOG_ERR(TAG, "File too small: %zu (need %u)", fileSize, pagecache::kHeaderSize);
     file_.close();
     evictCacheFile(cachePath_, "load-lut-file-too-small");
     resetState();
     return false;
   }
 
-  // Read lutOffset from header
-  file_.seek(HEADER_SIZE - 4);
-  uint32_t lutOffset = 0;
-  if (!serialization::readPodChecked(file_, lutOffset)) {
+  pagecache::HeaderInfo header;
+  const auto status = pagecache::readHeader(file_, header, false);
+  if (status != pagecache::HeaderReadStatus::Ok) {
     file_.close();
-    evictCacheFile(cachePath_, "load-lut-read-offset-failed");
+    evictCacheFile(cachePath_, status == pagecache::HeaderReadStatus::VersionMismatch ? "load-lut-version-mismatch"
+                                                                                      : "load-lut-read-header-failed");
     resetState();
     return false;
   }
 
-  // Read pageCount from header
-  file_.seek(HEADER_SIZE - 4 - 1 - 2);
-  uint16_t pageCount = 0;
-  if (!serialization::readPodChecked(file_, pageCount)) {
-    file_.close();
-    evictCacheFile(cachePath_, "load-lut-read-count-failed");
-    resetState();
-    return false;
-  }
-
-  if (!validateCacheIndexBounds(cachePath_.c_str(), fileSize, pageCount, lutOffset)) {
+  if (!pagecache::validateIndexBounds(cachePath_.c_str(), fileSize, header.pageCount, header.lutOffset)) {
     file_.close();
     evictCacheFile(cachePath_, "load-lut-invalid-header");
     resetState();
@@ -180,9 +123,9 @@ bool PageCache::loadLut(std::vector<uint32_t>& lut) {
 
   // Read existing LUT entries
   std::vector<uint32_t> loadedLut;
-  file_.seek(lutOffset);
-  loadedLut.reserve(pageCount);
-  for (uint16_t i = 0; i < pageCount; i++) {
+  file_.seek(header.lutOffset);
+  loadedLut.reserve(header.pageCount);
+  for (uint16_t i = 0; i < header.pageCount; i++) {
     uint32_t pos;
     if (!serialization::readPodChecked(file_, pos)) {
       file_.close();
@@ -190,9 +133,9 @@ bool PageCache::loadLut(std::vector<uint32_t>& lut) {
       resetState();
       return false;
     }
-    if (pos < HEADER_SIZE || pos >= lutOffset || pos >= fileSize) {
+    if (pos < pagecache::kHeaderSize || pos >= header.lutOffset || pos >= fileSize) {
       LOG_ERR(TAG, "Invalid page position in LUT: %u (lutOffset=%u file size=%zu)", pos,
-              static_cast<unsigned>(lutOffset), fileSize);
+              static_cast<unsigned>(header.lutOffset), fileSize);
       file_.close();
       evictCacheFile(cachePath_, "load-lut-invalid-entry");
       resetState();
@@ -203,8 +146,8 @@ bool PageCache::loadLut(std::vector<uint32_t>& lut) {
 
   file_.close();
   lut = std::move(loadedLut);
-  pageCount_ = pageCount;
-  lutOffset_ = lutOffset;
+  pageCount_ = header.pageCount;
+  lutOffset_ = header.lutOffset;
   return true;
 }
 
@@ -214,45 +157,21 @@ bool PageCache::loadRaw() {
     return false;
   }
 
-  uint8_t version;
-  if (!serialization::readPodChecked(file_, version)) {
+  pagecache::HeaderInfo header;
+  const auto status = pagecache::readHeader(file_, header, false);
+  if (status == pagecache::HeaderReadStatus::VersionMismatch) {
     file_.close();
-    evictCacheFile(cachePath_, "load-raw-read-version-failed");
     resetState();
     return false;
   }
-  if (version != CACHE_FILE_VERSION) {
+  if (status != pagecache::HeaderReadStatus::Ok) {
     file_.close();
-    resetState();
-    LOG_ERR(TAG, "Version mismatch: got %u, expected %u", version, CACHE_FILE_VERSION);
-    return false;
-  }
-
-  // Skip config fields, read pageCount and isPartial
-  file_.seek(HEADER_SIZE - 4 - 1 - 2);
-  uint16_t pageCount = 0;
-  if (!serialization::readPodChecked(file_, pageCount)) {
-    file_.close();
-    evictCacheFile(cachePath_, "load-raw-read-count-failed");
-    resetState();
-    return false;
-  }
-  uint8_t partial;
-  if (!serialization::readPodChecked(file_, partial)) {
-    file_.close();
-    evictCacheFile(cachePath_, "load-raw-read-partial-failed");
-    resetState();
-    return false;
-  }
-  uint32_t lutOffset = 0;
-  if (!serialization::readPodChecked(file_, lutOffset)) {
-    file_.close();
-    evictCacheFile(cachePath_, "load-raw-read-offset-failed");
+    evictCacheFile(cachePath_, "load-raw-read-header-failed");
     resetState();
     return false;
   }
 
-  if (!validateCacheIndexBounds(cachePath_.c_str(), file_.size(), pageCount, lutOffset)) {
+  if (!pagecache::validateIndexBounds(cachePath_.c_str(), file_.size(), header.pageCount, header.lutOffset)) {
     file_.close();
     evictCacheFile(cachePath_, "load-raw-invalid-header");
     resetState();
@@ -260,9 +179,9 @@ bool PageCache::loadRaw() {
   }
 
   file_.close();
-  pageCount_ = pageCount;
-  isPartial_ = (partial != 0);
-  lutOffset_ = lutOffset;
+  pageCount_ = header.pageCount;
+  isPartial_ = header.isPartial;
+  lutOffset_ = header.lutOffset;
   return true;
 }
 
@@ -272,78 +191,38 @@ bool PageCache::load(const RenderConfig& config) {
     return false;
   }
 
-  // Read and validate header
-  uint8_t version;
-  if (!serialization::readPodChecked(file_, version)) {
+  pagecache::HeaderInfo header;
+  const auto status = pagecache::readHeader(file_, header, true);
+  if (status == pagecache::HeaderReadStatus::VersionMismatch) {
     file_.close();
-    evictCacheFile(cachePath_, "load-read-version-failed");
-    resetState();
-    return false;
-  }
-  if (version != CACHE_FILE_VERSION) {
-    file_.close();
-    LOG_ERR(TAG, "Version mismatch: got %u, expected %u", version, CACHE_FILE_VERSION);
     clear();
     return false;
   }
-
-  RenderConfig fileConfig;
-  if (!serialization::readPodChecked(file_, fileConfig.fontId) ||
-      !serialization::readPodChecked(file_, fileConfig.lineCompression) ||
-      !serialization::readPodChecked(file_, fileConfig.readerFontSize) ||
-      !serialization::readPodChecked(file_, fileConfig.indentLevel) ||
-      !serialization::readPodChecked(file_, fileConfig.spacingLevel) ||
-      !serialization::readPodChecked(file_, fileConfig.paragraphAlignment) ||
-      !serialization::readPodChecked(file_, fileConfig.hyphenation) ||
-      !serialization::readPodChecked(file_, fileConfig.showImages) ||
-      !serialization::readPodChecked(file_, fileConfig.viewportWidth) ||
-      !serialization::readPodChecked(file_, fileConfig.viewportHeight)) {
+  if (status != pagecache::HeaderReadStatus::Ok) {
     file_.close();
-    evictCacheFile(cachePath_, "load-read-config-failed");
+    evictCacheFile(cachePath_, "load-read-header-failed");
     resetState();
     return false;
   }
 
-  if (config != fileConfig) {
+  if (config != header.config) {
     file_.close();
     LOG_INF(TAG, "Config mismatch, invalidating cache");
     clear();
     return false;
   }
 
-  uint16_t pageCount = 0;
-  if (!serialization::readPodChecked(file_, pageCount)) {
-    file_.close();
-    evictCacheFile(cachePath_, "load-read-count-failed");
-    resetState();
-    return false;
-  }
-  uint8_t partial;
-  if (!serialization::readPodChecked(file_, partial)) {
-    file_.close();
-    evictCacheFile(cachePath_, "load-read-partial-failed");
-    resetState();
-    return false;
-  }
-  uint32_t lutOffset = 0;
-  if (!serialization::readPodChecked(file_, lutOffset)) {
-    file_.close();
-    evictCacheFile(cachePath_, "load-read-offset-failed");
-    resetState();
-    return false;
-  }
-
-  if (!validateCacheIndexBounds(cachePath_.c_str(), file_.size(), pageCount, lutOffset)) {
+  if (!pagecache::validateIndexBounds(cachePath_.c_str(), file_.size(), header.pageCount, header.lutOffset)) {
     file_.close();
     clear();
     return false;
   }
 
   file_.close();
-  pageCount_ = pageCount;
-  isPartial_ = (partial != 0);
+  pageCount_ = header.pageCount;
+  isPartial_ = header.isPartial;
   config_ = config;
-  lutOffset_ = lutOffset;
+  lutOffset_ = header.lutOffset;
   LOG_INF(TAG, "Loaded: %d pages, partial=%d", pageCount_, isPartial_);
   return true;
 }
@@ -610,40 +489,35 @@ std::unique_ptr<Page> PageCache::loadPage(uint16_t pageNum) {
     const size_t fileSize = file_.size();
 
     // Read pageCount from header to validate LUT bounds against on-disk state.
-    file_.seek(HEADER_SIZE - 4 - 1 - 2);
-    uint16_t storedPageCount = 0;
-    if (!serialization::readPodChecked(file_, storedPageCount)) {
+    pagecache::HeaderInfo header;
+    const auto status = pagecache::readHeader(file_, header, false);
+    if (status == pagecache::HeaderReadStatus::VersionMismatch) {
       file_.close();
-      evictCacheFile(cachePath_, "load-page-read-count-failed");
+      clear();
+      return nullptr;
+    }
+    if (status != pagecache::HeaderReadStatus::Ok) {
+      file_.close();
+      evictCacheFile(cachePath_, "load-page-read-header-failed");
       resetState();
       return nullptr;
     }
 
-    // Read LUT offset from header
-    file_.seek(HEADER_SIZE - 4);
-    uint32_t lutOffset;
-    if (!serialization::readPodChecked(file_, lutOffset)) {
-      file_.close();
-      evictCacheFile(cachePath_, "load-page-read-offset-failed");
-      resetState();
-      return nullptr;
-    }
-
-    if (!validateCacheIndexBounds(cachePath_.c_str(), fileSize, storedPageCount, lutOffset)) {
+    if (!pagecache::validateIndexBounds(cachePath_.c_str(), fileSize, header.pageCount, header.lutOffset)) {
       file_.close();
       clear();
       return nullptr;
     }
 
-    if (pageNum >= storedPageCount) {
-      LOG_ERR(TAG, "Page %d out of range in on-disk cache (max %d)", pageNum, storedPageCount);
+    if (pageNum >= header.pageCount) {
+      LOG_ERR(TAG, "Page %d out of range in on-disk cache (max %d)", pageNum, header.pageCount);
       file_.close();
-      pageCount_ = storedPageCount;
+      pageCount_ = header.pageCount;
       return nullptr;
     }
 
     // Read page position from LUT
-    file_.seek(lutOffset + static_cast<size_t>(pageNum) * sizeof(uint32_t));
+    file_.seek(header.lutOffset + static_cast<size_t>(pageNum) * sizeof(uint32_t));
     uint32_t pagePos;
     if (!serialization::readPodChecked(file_, pagePos)) {
       file_.close();
@@ -653,9 +527,9 @@ std::unique_ptr<Page> PageCache::loadPage(uint16_t pageNum) {
     }
 
     // Validate page position
-    if (pagePos < HEADER_SIZE || pagePos >= lutOffset || pagePos >= fileSize) {
+    if (pagePos < pagecache::kHeaderSize || pagePos >= header.lutOffset || pagePos >= fileSize) {
       LOG_ERR(TAG, "Invalid page position: %u (lutOffset=%u file size=%zu)", pagePos,
-              static_cast<unsigned>(lutOffset), fileSize);
+              static_cast<unsigned>(header.lutOffset), fileSize);
       file_.close();
       clear();
       return nullptr;
