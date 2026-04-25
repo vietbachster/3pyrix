@@ -2,6 +2,7 @@
 
 #include <BackgroundTask.h>
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -13,6 +14,7 @@
 #include "../rendering/XtcPageRenderer.h"
 #include "../ui/views/HomeView.h"
 #include "../ui/views/ReaderViews.h"
+#include "reader/ReaderResourceController.h"
 #include "State.h"
 
 class ContentParser;
@@ -51,6 +53,8 @@ class ReaderState : public State {
   void setCurrentPage(uint32_t page) { currentPage_ = page; }
 
  private:
+  using ResourceSession = reader::ReaderResourceController::Session;
+
   GfxRenderer& renderer_;
   XtcPageRenderer xtcRenderer_;
   char contentPath_[256];
@@ -77,24 +81,22 @@ class ReaderState : public State {
   // First text content spine index (from EPUB guide, 0 if not specified)
   int textStartIndex_ = 0;
 
-  // Unified page cache for all content types
-  // Ownership model: main thread owns pageCache_/parser_ when !cacheTask_.isRunning()
-  //                  background task owns pageCache_/parser_ when cacheTask_.isRunning()
-  // Navigation ALWAYS stops task first, then accesses cache/parser
-  std::unique_ptr<PageCache> pageCache_;
-
-  // Persistent parser for incremental (hot) extends — kept alive between extend calls
-  // so the parser can resume from where it left off instead of re-parsing from byte 0
-  std::unique_ptr<ContentParser> parser_;
-  int parserSpineIndex_ = -1;
+  // Reader resource ownership now lives in a dedicated controller. ReaderState
+  // keeps aliases here to limit churn while the larger split continues.
+  reader::ReaderResourceController resourceController_;
+  std::unique_ptr<PageCache>& pageCache_;
+  std::unique_ptr<ContentParser>& parser_;
+  int& parserSpineIndex_;
   uint8_t pagesUntilFullRefresh_;
 
   // Background caching (uses BackgroundTask for proper lifecycle management)
   BackgroundTask cacheTask_;
   Core* coreForCacheTask_ = nullptr;
-  bool thumbnailDone_ = false;
+  std::atomic<bool>& thumbnailDone_;
   void startBackgroundCaching(Core& core);
   void stopBackgroundCaching();
+  ResourceSession acquireForegroundResources(const char* reason);
+  ResourceSession acquireWorkerResources(const char* reason);
 
   // Navigation helpers (delegates to ReaderNavigation)
   void navigateNext(Core& core);

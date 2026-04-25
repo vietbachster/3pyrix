@@ -289,12 +289,33 @@ ReaderState::ReaderState(GfxRenderer& renderer)
       framePreservedOnWake_(false),
       currentSpineIndex_(0),
       currentSectionPage_(0),
+      resourceController_(renderer),
+      pageCache_(resourceController_.pageCacheRef()),
+      parser_(resourceController_.parserRef()),
+      parserSpineIndex_(resourceController_.parserSpineIndexRef()),
       pagesUntilFullRefresh_(1),
+      thumbnailDone_(resourceController_.thumbnailDoneRef()),
       tocView_{} {
   contentPath_[0] = '\0';
 }
 
 ReaderState::~ReaderState() { stopBackgroundCaching(); }
+
+ReaderState::ResourceSession ReaderState::acquireForegroundResources(const char* reason) {
+  auto session = resourceController_.acquireForeground(reason);
+  if (!session) {
+    LOG_ERR(TAG, "Failed to acquire foreground reader resources (%s)", reason ? reason : "-");
+  }
+  return session;
+}
+
+ReaderState::ResourceSession ReaderState::acquireWorkerResources(const char* reason) {
+  auto session = resourceController_.acquireWorker(reason);
+  if (!session) {
+    LOG_ERR(TAG, "Failed to acquire worker reader resources (%s)", reason ? reason : "-");
+  }
+  return session;
+}
 
 void ReaderState::setContentPath(const char* path) {
   if (path) {
@@ -352,9 +373,12 @@ void ReaderState::enter(Core& core) {
   autoPageTurnTargetMs_ = 0;
   lastPageWordCount_ = 0;
   stopBackgroundCaching();  // Ensure any previous task is stopped
-  parser_.reset();          // Safe - task is stopped
-  parserSpineIndex_ = -1;
-  pageCache_.reset();
+  {
+    auto resources = acquireForegroundResources("enter-reset-session");
+    if (resources) {
+      resourceController_.resetSession();
+    }
+  }
   currentSpineIndex_ = 0;
   currentSectionPage_ = 0;  // Will be set to -1 after progress load if at start
 
@@ -417,7 +441,7 @@ void ReaderState::enter(Core& core) {
   // Reset state for new book
   textStartIndex_ = 0;
   hasCover_ = false;
-  thumbnailDone_ = false;
+  thumbnailDone_.store(false, std::memory_order_release);
   switch (core.content.metadata().type) {
     case ContentType::Epub: {
       auto* provider = core.content.asEpub();
@@ -492,7 +516,14 @@ void ReaderState::exit(Core& core) {
   stopBackgroundCaching();
 
   if (contentLoaded_) {
-    ProgressManager::Progress progress = buildProgressSnapshot(core);
+    ProgressManager::Progress progress;
+    {
+      auto resources = acquireForegroundResources("exit-save-progress");
+      if (resources) {
+        progress = buildProgressSnapshot(core);
+        resourceController_.clearDocumentResources();
+      }
+    }
     ProgressManager::save(core, core.content.cacheDir(), core.content.metadata().type, progress);
 
     if (core.preserveReaderPageOnSleep) {
@@ -509,10 +540,6 @@ void ReaderState::exit(Core& core) {
       clearSleepResumeTransition();
     }
 
-    // Safe to reset - task is stopped, we own pageCache_/parser_
-    parser_.reset();
-    parserSpineIndex_ = -1;
-    pageCache_.reset();
     core.content.close();
   }
 
@@ -741,11 +768,17 @@ void ReaderState::navigateNext(Core& core) {
     }
     int firstContentSpine = calcFirstContentSpine(hasCover_, textStartIndex_, spineCount);
 
-    if (firstContentSpine != currentSpineIndex_) {
-      currentSpineIndex_ = firstContentSpine;
-      parser_.reset();
-      parserSpineIndex_ = -1;
-      pageCache_.reset();
+    {
+      auto resources = acquireForegroundResources("navigate-next-cover");
+      if (!resources) {
+        startBackgroundCaching(core);
+        return;
+      }
+
+      if (firstContentSpine != currentSpineIndex_) {
+        currentSpineIndex_ = firstContentSpine;
+        resourceController_.clearDocumentResources();
+      }
     }
     currentSectionPage_ = 0;
     needsRender_ = true;
@@ -753,11 +786,20 @@ void ReaderState::navigateNext(Core& core) {
     return;
   }
 
-  ReaderNavigation::Position pos;
-  pos.spineIndex = currentSpineIndex_;
-  pos.sectionPage = currentSectionPage_;
-  pos.flatPage = currentPage_;
-  auto result = ReaderNavigation::next(type, pos, pageCache_.get(), core.content.pageCount());
+  ReaderNavigation::NavResult result;
+  {
+    auto resources = acquireForegroundResources("navigate-next");
+    if (!resources) {
+      startBackgroundCaching(core);
+      return;
+    }
+
+    ReaderNavigation::Position pos;
+    pos.spineIndex = currentSpineIndex_;
+    pos.sectionPage = currentSectionPage_;
+    pos.flatPage = currentPage_;
+    result = ReaderNavigation::next(type, pos, pageCache_.get(), core.content.pageCount());
+  }
   applyNavResult(result, core);
 }
 
@@ -786,31 +828,43 @@ void ReaderState::navigatePrev(Core& core) {
   }
   int firstContentSpine = calcFirstContentSpine(hasCover_, textStartIndex_, spineCount);
 
-  // At first page of text content
-  if (currentSpineIndex_ == firstContentSpine && currentSectionPage_ == 0) {
-    // Only go to cover if it exists and images enabled
-    if (hasCover_ && core.settings.showImages) {
-      currentSpineIndex_ = 0;
-      currentSectionPage_ = -1;
-      parser_.reset();
-      parserSpineIndex_ = -1;
-      pageCache_.reset();  // Don't need cache for cover
-      needsRender_ = true;
-    }
-    return;  // At start of book either way
-  }
-
   // Prevent going back from cover
   if (currentSpineIndex_ == 0 && currentSectionPage_ == -1) {
     startBackgroundCaching(core);  // Resume task before returning
     return;                        // Already at cover
   }
 
-  ReaderNavigation::Position pos;
-  pos.spineIndex = currentSpineIndex_;
-  pos.sectionPage = currentSectionPage_;
-  pos.flatPage = currentPage_;
-  auto result = ReaderNavigation::prev(type, pos, pageCache_.get());
+  bool handledAtStart = false;
+  ReaderNavigation::NavResult result;
+  {
+    auto resources = acquireForegroundResources("navigate-prev");
+    if (!resources) {
+      startBackgroundCaching(core);
+      return;
+    }
+
+    if (currentSpineIndex_ == firstContentSpine && currentSectionPage_ == 0) {
+      // Only go to cover if it exists and images enabled
+      if (hasCover_ && core.settings.showImages) {
+        currentSpineIndex_ = 0;
+        currentSectionPage_ = -1;
+        resourceController_.clearDocumentResources();  // Don't need cache for cover
+        needsRender_ = true;
+      }
+      handledAtStart = true;
+    } else {
+      ReaderNavigation::Position pos;
+      pos.spineIndex = currentSpineIndex_;
+      pos.sectionPage = currentSectionPage_;
+      pos.flatPage = currentPage_;
+      result = ReaderNavigation::prev(type, pos, pageCache_.get());
+    }
+  }
+
+  if (handledAtStart) {
+    startBackgroundCaching(core);
+    return;
+  }
   applyNavResult(result, core);
 }
 
@@ -820,9 +874,10 @@ void ReaderState::applyNavResult(const ReaderNavigation::NavResult& result, Core
   currentPage_ = result.position.flatPage;
   needsRender_ = result.needsRender;
   if (result.needsCacheReset) {
-    parser_.reset();  // Safe - task already stopped by caller
-    parserSpineIndex_ = -1;
-    pageCache_.reset();
+    auto resources = acquireForegroundResources("apply-nav-reset");
+    if (resources) {
+      resourceController_.clearDocumentResources();
+    }
   }
   startBackgroundCaching(core);  // Resume caching
 }
@@ -862,11 +917,16 @@ void ReaderState::navigateNextChapter(Core& core) {
   if (currentSpineIndex_ + 1 >= static_cast<int>(spineCount)) return;
 
   stopBackgroundCaching();
-  currentSpineIndex_++;
-  currentSectionPage_ = 0;
-  parser_.reset();
-  parserSpineIndex_ = -1;
-  pageCache_.reset();
+  {
+    auto resources = acquireForegroundResources("next-chapter-reset");
+    if (!resources) {
+      startBackgroundCaching(core);
+      return;
+    }
+    currentSpineIndex_++;
+    currentSectionPage_ = 0;
+    resourceController_.clearDocumentResources();
+  }
   needsRender_ = true;
   startBackgroundCaching(core);
 }
@@ -911,26 +971,38 @@ void ReaderState::navigatePrevChapter(Core& core) {
 
   stopBackgroundCaching();
 
-  if (currentSectionPage_ > 0) {
-    // Go to beginning of current chapter
-    currentSectionPage_ = 0;
-  } else {
-    // Go to previous chapter
-    auto* provider = core.content.asEpub();
-    size_t spineCount = 1;
-    if (provider && provider->getEpub()) {
-      spineCount = provider->getEpub()->getSpineItemsCount();
-    }
-    int firstContentSpine = calcFirstContentSpine(hasCover_, textStartIndex_, spineCount);
-    if (currentSpineIndex_ <= firstContentSpine) {
+  bool reachedStartOfBook = false;
+  {
+    auto resources = acquireForegroundResources("prev-chapter-reset");
+    if (!resources) {
       startBackgroundCaching(core);
       return;
     }
-    currentSpineIndex_--;
-    currentSectionPage_ = 0;
-    parser_.reset();
-    parserSpineIndex_ = -1;
-    pageCache_.reset();
+
+    if (currentSectionPage_ > 0) {
+      // Go to beginning of current chapter
+      currentSectionPage_ = 0;
+    } else {
+      // Go to previous chapter
+      auto* provider = core.content.asEpub();
+      size_t spineCount = 1;
+      if (provider && provider->getEpub()) {
+        spineCount = provider->getEpub()->getSpineItemsCount();
+      }
+      int firstContentSpine = calcFirstContentSpine(hasCover_, textStartIndex_, spineCount);
+      if (currentSpineIndex_ <= firstContentSpine) {
+        reachedStartOfBook = true;
+      } else {
+        currentSpineIndex_--;
+        currentSectionPage_ = 0;
+        resourceController_.clearDocumentResources();
+      }
+    }
+  }
+
+  if (reachedStartOfBook) {
+    startBackgroundCaching(core);
+    return;
   }
 
   needsRender_ = true;
@@ -984,7 +1056,15 @@ void ReaderState::renderCurrentPage(Core& core) {
       break;
   }
 
-  if (!cacheTask_.isRunning() && (!pageCache_ || !thumbnailDone_)) {
+  bool shouldResumeCaching = false;
+  if (!cacheTask_.isRunning()) {
+    auto resources = acquireForegroundResources("render-post-check");
+    if (resources) {
+      shouldResumeCaching = !pageCache_ || !thumbnailDone_.load(std::memory_order_acquire);
+    }
+  }
+
+  if (shouldResumeCaching) {
     startBackgroundCaching(core);
   }
 
@@ -1012,6 +1092,12 @@ void ReaderState::renderCachedPage(Core& core) {
 
   // Stop background task to ensure we own pageCache_ (ownership model)
   stopBackgroundCaching();
+
+  auto resources = acquireForegroundResources("render-cached-page");
+  if (!resources) {
+    needsRender_ = false;
+    return;
+  }
 
   // Background task may have left parser in inconsistent state
   if (!pageCache_ && parser_ && parserSpineIndex_ == currentSpineIndex_) {
@@ -1575,12 +1661,15 @@ void ReaderState::toggleReadingOrientation(Core& core) {
   // Stop background task before reading pageCache_ to avoid race condition.
   stopBackgroundCaching();
 
-  if (contentLoaded_) {
-    pendingProgress_ = buildProgressSnapshot(core);
-    pendingProgressRestore_ = pendingProgress_.hasTextAnchor();
-    currentSpineIndex_ = pendingProgress_.spineIndex;
-    currentSectionPage_ = pendingProgress_.sectionPage;
-    currentPage_ = pendingProgress_.flatPage;
+  {
+    auto resources = acquireForegroundResources("toggle-orientation");
+    if (resources && contentLoaded_) {
+      pendingProgress_ = buildProgressSnapshot(core);
+      pendingProgressRestore_ = pendingProgress_.hasTextAnchor();
+      currentSpineIndex_ = pendingProgress_.spineIndex;
+      currentSectionPage_ = pendingProgress_.sectionPage;
+      currentPage_ = pendingProgress_.flatPage;
+    }
   }
 
   core.settings.orientation =
@@ -1604,9 +1693,12 @@ void ReaderState::toggleReadingOrientation(Core& core) {
   renderer_.displayBuffer();
   core.display.markDirty();
 
-  parser_.reset();
-  parserSpineIndex_ = -1;
-  pageCache_.reset();
+  {
+    auto resources = acquireForegroundResources("toggle-orientation-reset");
+    if (resources) {
+      resourceController_.clearDocumentResources();
+    }
+  }
   pagesUntilFullRefresh_ = 1;
   endOfBookShown_ = false;
   needsRender_ = true;
@@ -1650,10 +1742,10 @@ void ReaderState::startBackgroundCaching(Core& core) {
   // XTC content uses pre-rendered bitmaps — no page cache needed.
   // Generate cover + thumbnail synchronously since XTC has no background task.
   if (core.content.metadata().type == ContentType::Xtc) {
-    if (!thumbnailDone_) {
+    if (!thumbnailDone_.load(std::memory_order_acquire)) {
       core.content.generateCover(true);
       core.content.generateThumbnail();
-      thumbnailDone_ = true;
+      thumbnailDone_.store(true, std::memory_order_release);
     }
     return;
   }
@@ -1692,6 +1784,10 @@ void ReaderState::startBackgroundCaching(Core& core) {
 
         Core& coreRef = *corePtr;
         ContentType type = coreRef.content.metadata().type;
+        auto resources = acquireWorkerResources("background-cache");
+        if (!resources) {
+          return;
+        }
 
         // Build cache if it doesn't exist
         if (!pageCache_ && !cacheTask_.shouldStop()) {
@@ -1740,9 +1836,9 @@ void ReaderState::startBackgroundCaching(Core& core) {
 
         // Generate thumbnail from cover for HomeState (lower priority than page cache)
         // Only attempt once per book open — skip if already tried (success or failure)
-        if (!thumbnailDone_ && !cacheTask_.shouldStop()) {
+        if (!thumbnailDone_.load(std::memory_order_acquire) && !cacheTask_.shouldStop()) {
           coreRef.content.generateThumbnail();
-          thumbnailDone_ = true;
+          thumbnailDone_.store(true, std::memory_order_release);
         }
 
         if (!cacheTask_.shouldStop()) {
@@ -1960,14 +2056,16 @@ void ReaderState::jumpToTocEntry(Core& core, int tocIndex) {
     auto* provider = core.content.asEpub();
     if (!provider || !provider->getEpub()) return;
     auto epub = provider->getEpubShared();
+    auto resources = acquireForegroundResources("toc-jump");
+    if (!resources) {
+      return;
+    }
 
     if (static_cast<int>(chapter.pageNum) != currentSpineIndex_) {
       // Different spine — full reset
       // Task already stopped by enterTocMode(); caller restarts after exitTocMode()
       currentSpineIndex_ = chapter.pageNum;
-      parser_.reset();
-      parserSpineIndex_ = -1;
-      pageCache_.reset();
+      resourceController_.clearDocumentResources();
       currentSectionPage_ = 0;
     } else {
       // Same spine — navigate using anchor (default to page 0)
@@ -2062,7 +2160,13 @@ void ReaderState::exitToUI(Core& core) {
 
   // Save progress at last rendered position
   if (contentLoaded_) {
-    ProgressManager::Progress progress = buildProgressSnapshot(core);
+    ProgressManager::Progress progress;
+    {
+      auto resources = acquireForegroundResources("exit-to-ui-save-progress");
+      if (resources) {
+        progress = buildProgressSnapshot(core);
+      }
+    }
     ProgressManager::save(core, core.content.cacheDir(), core.content.metadata().type, progress);
     // Skip pageCache_.reset() and content.close() — ESP.restart() follows,
     // and if stopBackgroundCaching() timed out the task still uses them.
@@ -2086,7 +2190,13 @@ void ReaderState::exitToFileList(Core& core) {
   stopBackgroundCaching();
 
   if (contentLoaded_) {
-    ProgressManager::Progress progress = buildProgressSnapshot(core);
+    ProgressManager::Progress progress;
+    {
+      auto resources = acquireForegroundResources("exit-to-file-list-save-progress");
+      if (resources) {
+        progress = buildProgressSnapshot(core);
+      }
+    }
     ProgressManager::save(core, core.content.cacheDir(), core.content.metadata().type, progress);
   }
 
