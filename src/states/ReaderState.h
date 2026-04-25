@@ -1,7 +1,5 @@
 #pragma once
 
-#include <BackgroundTask.h>
-
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -14,7 +12,8 @@
 #include "../rendering/XtcPageRenderer.h"
 #include "../ui/views/HomeView.h"
 #include "../ui/views/ReaderViews.h"
-#include "reader/ReaderResourceController.h"
+#include "reader/ReaderAsyncJobsController.h"
+#include "reader/ReaderCacheController.h"
 #include "State.h"
 
 class ContentParser;
@@ -53,7 +52,7 @@ class ReaderState : public State {
   void setCurrentPage(uint32_t page) { currentPage_ = page; }
 
  private:
-  using ResourceSession = reader::ReaderResourceController::Session;
+  using ResourceSession = reader::ReaderCacheController::Session;
 
   GfxRenderer& renderer_;
   XtcPageRenderer xtcRenderer_;
@@ -83,15 +82,13 @@ class ReaderState : public State {
 
   // Reader resource ownership now lives in a dedicated controller. ReaderState
   // keeps aliases here to limit churn while the larger split continues.
-  reader::ReaderResourceController resourceController_;
+  reader::ReaderCacheController cacheController_;
+  reader::ReaderAsyncJobsController asyncJobsController_;
   std::unique_ptr<PageCache>& pageCache_;
   std::unique_ptr<ContentParser>& parser_;
   int& parserSpineIndex_;
   uint8_t pagesUntilFullRefresh_;
 
-  // Background caching (uses BackgroundTask for proper lifecycle management)
-  BackgroundTask cacheTask_;
-  Core* coreForCacheTask_ = nullptr;
   std::atomic<bool>& thumbnailDone_;
   void startBackgroundCaching(Core& core);
   void stopBackgroundCaching();
@@ -141,9 +138,6 @@ class ReaderState : public State {
   void loadCacheFromDisk(Core& core);
   void createOrExtendCache(Core& core);
 
-  void createOrExtendCacheImpl(ContentParser& parser, const std::string& cachePath, const RenderConfig& config);
-  void backgroundCacheImpl(ContentParser& parser, const std::string& cachePath, const RenderConfig& config);
-
   // Display helpers
   void displayWithRefresh(Core& core);
   bool contentSupportsAutoPageTurn(const Core& core) const;
@@ -169,14 +163,6 @@ class ReaderState : public State {
     int height;
   };
   Viewport getReaderViewport() const;
-
-  // Get first content spine index (skips cover document when appropriate)
-  static int calcFirstContentSpine(bool hasCover, int textStartIndex, size_t spineCount);
-
-  // Anchor-to-page persistence for intra-spine TOC navigation
-  static void saveAnchorMap(const ContentParser& parser, const std::string& cachePath);
-  static int loadAnchorPage(const std::string& cachePath, const std::string& anchor);
-  static std::vector<std::pair<std::string, uint16_t>> loadAnchorMap(const std::string& cachePath);
 
   // Source state (where reader was opened from)
   StateId sourceState_ = StateId::Home;

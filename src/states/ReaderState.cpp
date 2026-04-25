@@ -107,180 +107,6 @@ std::string pageTextForAnchorMatch(const Page& page) {
 }
 }  // namespace
 
-void ReaderState::saveAnchorMap(const ContentParser& parser, const std::string& cachePath) {
-  const auto& anchors = parser.getAnchorMap();
-
-  std::string anchorPath = cachePath + ".anchors";
-  FsFile file;
-  if (!SdMan.openFileForWrite("RDR", anchorPath, file)) return;
-
-  if (anchors.size() > UINT16_MAX) {
-    uint16_t zero = 0;
-    serialization::writePod(file, zero);
-    file.close();
-    return;
-  }
-  uint16_t count = static_cast<uint16_t>(anchors.size());
-  serialization::writePod(file, count);
-  for (const auto& entry : anchors) {
-    serialization::writeString(file, entry.first);
-    serialization::writePod(file, entry.second);
-  }
-  if (file.getWriteError()) {
-    LOG_ERR(TAG, "Write error while saving anchor map (disk full?)");
-  }
-  file.close();
-}
-
-int ReaderState::loadAnchorPage(const std::string& cachePath, const std::string& anchor) {
-  std::string anchorPath = cachePath + ".anchors";
-  FsFile file;
-  if (!SdMan.openFileForRead("RDR", anchorPath, file)) return -1;
-
-  uint16_t count;
-  if (!serialization::readPodChecked(file, count)) {
-    file.close();
-    return -1;
-  }
-
-  for (uint16_t i = 0; i < count; i++) {
-    std::string anchorId;
-    uint16_t page;
-    if (!serialization::readString(file, anchorId) || !serialization::readPodChecked(file, page)) {
-      file.close();
-      return -1;
-    }
-    if (anchorId == anchor) {
-      file.close();
-      return page;
-    }
-  }
-
-  file.close();
-  return -1;
-}
-
-std::vector<std::pair<std::string, uint16_t>> ReaderState::loadAnchorMap(const std::string& cachePath) {
-  std::vector<std::pair<std::string, uint16_t>> anchors;
-  std::string anchorPath = cachePath + ".anchors";
-  FsFile file;
-  if (!SdMan.openFileForRead("RDR", anchorPath, file)) return anchors;
-
-  uint16_t count;
-  if (serialization::readPodChecked(file, count)) {
-    for (uint16_t i = 0; i < count; i++) {
-      std::string anchorId;
-      uint16_t page;
-      if (!serialization::readString(file, anchorId) || !serialization::readPodChecked(file, page)) break;
-      anchors.emplace_back(std::move(anchorId), page);
-    }
-  }
-  file.close();
-  return anchors;
-}
-
-int ReaderState::calcFirstContentSpine(bool hasCover, int textStartIndex, size_t spineCount) {
-  if (hasCover && textStartIndex == 0 && spineCount > 1) {
-    return 1;
-  }
-  return textStartIndex;
-}
-
-// Cache creation/extension implementation
-// Called from main thread when background task is NOT running (ownership model)
-// No mutex needed - main thread owns pageCache_/parser_ when task is stopped
-void ReaderState::createOrExtendCacheImpl(ContentParser& parser, const std::string& cachePath,
-                                          const RenderConfig& config) {
-  bool needsCreate = false;
-  bool needsExtend = false;
-
-  if (!pageCache_) {
-    pageCache_.reset(new (std::nothrow) PageCache(cachePath));
-    if (!pageCache_) {
-      LOG_ERR(TAG, "createOrExtendCache: OOM allocating PageCache");
-      return;
-    }
-    if (pageCache_->load(config)) {
-      if (!SdMan.exists((cachePath + ".anchors").c_str())) {
-        needsCreate = true;  // Migration: rebuild cache to generate anchor map
-      } else {
-        needsExtend = pageCache_->isPartial();
-      }
-    } else {
-      needsCreate = true;
-    }
-  } else {
-    if (!SdMan.exists((cachePath + ".anchors").c_str())) {
-      needsCreate = true;  // Migration: rebuild cache to generate anchor map
-    } else {
-      needsExtend = pageCache_->isPartial();
-    }
-  }
-
-  if (pageCache_) {
-    if (needsExtend) {
-      pageCache_->extend(parser, PageCache::DEFAULT_CACHE_CHUNK);
-      saveAnchorMap(parser, cachePath);
-    } else if (needsCreate) {
-      parser.reset();  // Ensure clean state for fresh cache creation
-      pageCache_->create(parser, config, PageCache::DEFAULT_CACHE_CHUNK);
-      saveAnchorMap(parser, cachePath);
-    }
-  }
-}
-
-// Background caching implementation (handles stop request checks)
-// Called from background task - uses BackgroundTask's shouldStop() and getAbortCallback()
-// Ownership: background task owns pageCache_/parser_ while running
-void ReaderState::backgroundCacheImpl(ContentParser& parser, const std::string& cachePath, const RenderConfig& config) {
-  auto shouldAbort = cacheTask_.getAbortCallback();
-
-  // Check for early abort before doing anything
-  if (cacheTask_.shouldStop()) {
-    LOG_DBG(TAG, "Background cache aborted before start");
-    return;
-  }
-
-  // Create/load cache (we own pageCache_ while task is running)
-  pageCache_.reset(new (std::nothrow) PageCache(cachePath));
-  if (!pageCache_) {
-    LOG_ERR(TAG, "backgroundCache: OOM allocating PageCache");
-    return;
-  }
-  bool loaded = pageCache_->load(config);
-  // Migration: rebuild cache to generate anchor map if missing
-  if (loaded && !SdMan.exists((cachePath + ".anchors").c_str())) {
-    loaded = false;
-  }
-  bool needsExtend = loaded && pageCache_->needsExtension(currentSectionPage_);
-
-  // Check for abort after setup
-  if (cacheTask_.shouldStop()) {
-    pageCache_.reset();
-    LOG_DBG(TAG, "Background cache aborted after setup");
-    return;
-  }
-
-  if (!loaded || needsExtend) {
-    bool success;
-    if (needsExtend) {
-      success = pageCache_->extend(parser, PageCache::DEFAULT_CACHE_CHUNK, shouldAbort);
-    } else {
-      parser.reset();  // Ensure clean state for fresh cache creation
-      success = pageCache_->create(parser, config, PageCache::DEFAULT_CACHE_CHUNK, 0, shouldAbort);
-    }
-
-    if (success && !cacheTask_.shouldStop()) {
-      saveAnchorMap(parser, cachePath);
-    }
-
-    if (!success || cacheTask_.shouldStop()) {
-      LOG_ERR(TAG, "Cache creation failed or aborted, clearing pageCache");
-      pageCache_.reset();
-    }
-  }
-}
-
 ReaderState::ReaderState(GfxRenderer& renderer)
     : renderer_(renderer),
       xtcRenderer_(renderer),
@@ -290,12 +116,12 @@ ReaderState::ReaderState(GfxRenderer& renderer)
       framePreservedOnWake_(false),
       currentSpineIndex_(0),
       currentSectionPage_(0),
-      resourceController_(renderer),
-      pageCache_(resourceController_.pageCacheRef()),
-      parser_(resourceController_.parserRef()),
-      parserSpineIndex_(resourceController_.parserSpineIndexRef()),
+      cacheController_(renderer),
+      pageCache_(cacheController_.pageCacheRef()),
+      parser_(cacheController_.parserRef()),
+      parserSpineIndex_(cacheController_.parserSpineIndexRef()),
       pagesUntilFullRefresh_(1),
-      thumbnailDone_(resourceController_.thumbnailDoneRef()),
+      thumbnailDone_(cacheController_.thumbnailDoneRef()),
       tocView_{} {
   contentPath_[0] = '\0';
 }
@@ -303,7 +129,7 @@ ReaderState::ReaderState(GfxRenderer& renderer)
 ReaderState::~ReaderState() { stopBackgroundCaching(); }
 
 ReaderState::ResourceSession ReaderState::acquireForegroundResources(const char* reason) {
-  auto session = resourceController_.acquireForeground(reason);
+  auto session = cacheController_.acquireForeground(reason);
   if (!session) {
     LOG_ERR(TAG, "Failed to acquire foreground reader resources (%s)", reason ? reason : "-");
   }
@@ -311,7 +137,7 @@ ReaderState::ResourceSession ReaderState::acquireForegroundResources(const char*
 }
 
 ReaderState::ResourceSession ReaderState::acquireWorkerResources(const char* reason) {
-  auto session = resourceController_.acquireWorker(reason);
+  auto session = cacheController_.acquireWorker(reason);
   if (!session) {
     LOG_ERR(TAG, "Failed to acquire worker reader resources (%s)", reason ? reason : "-");
   }
@@ -325,6 +151,7 @@ void ReaderState::setContentPath(const char* path) {
   } else {
     contentPath_[0] = '\0';
   }
+  cacheController_.setContentPath(contentPath_);
 }
 
 bool ReaderState::contentSupportsAutoPageTurn(const Core& core) const {
@@ -377,7 +204,7 @@ void ReaderState::enter(Core& core) {
   {
     auto resources = acquireForegroundResources("enter-reset-session");
     if (resources) {
-      resourceController_.resetSession();
+      cacheController_.resetSession();
     }
   }
   currentSpineIndex_ = 0;
@@ -389,6 +216,7 @@ void ReaderState::enter(Core& core) {
     contentPath_[sizeof(contentPath_) - 1] = '\0';
     core.buf.path[0] = '\0';
   }
+  cacheController_.setContentPath(contentPath_);
 
   // Determine source state from boot transition
   const auto& transition = getTransition();
@@ -522,7 +350,7 @@ void ReaderState::exit(Core& core) {
       auto resources = acquireForegroundResources("exit-save-progress");
       if (resources) {
         progress = buildProgressSnapshot(core);
-        resourceController_.clearDocumentResources();
+        cacheController_.clearDocumentResources();
       }
     }
     ProgressManager::save(core, core.content.cacheDir(), core.content.metadata().type, progress);
@@ -767,7 +595,7 @@ void ReaderState::navigateNext(Core& core) {
     if (provider && provider->getEpub()) {
       spineCount = provider->getEpub()->getSpineItemsCount();
     }
-    int firstContentSpine = calcFirstContentSpine(hasCover_, textStartIndex_, spineCount);
+    int firstContentSpine = reader::ReaderCacheController::calcFirstContentSpine(hasCover_, textStartIndex_, spineCount);
 
     {
       auto resources = acquireForegroundResources("navigate-next-cover");
@@ -778,7 +606,7 @@ void ReaderState::navigateNext(Core& core) {
 
       if (firstContentSpine != currentSpineIndex_) {
         currentSpineIndex_ = firstContentSpine;
-        resourceController_.clearDocumentResources();
+        cacheController_.clearDocumentResources();
       }
     }
     currentSectionPage_ = 0;
@@ -827,7 +655,7 @@ void ReaderState::navigatePrev(Core& core) {
   if (provider && provider->getEpub()) {
     spineCount = provider->getEpub()->getSpineItemsCount();
   }
-  int firstContentSpine = calcFirstContentSpine(hasCover_, textStartIndex_, spineCount);
+  int firstContentSpine = reader::ReaderCacheController::calcFirstContentSpine(hasCover_, textStartIndex_, spineCount);
 
   // Prevent going back from cover
   if (currentSpineIndex_ == 0 && currentSectionPage_ == -1) {
@@ -849,7 +677,7 @@ void ReaderState::navigatePrev(Core& core) {
       if (hasCover_ && core.settings.showImages) {
         currentSpineIndex_ = 0;
         currentSectionPage_ = -1;
-        resourceController_.clearDocumentResources();  // Don't need cache for cover
+        cacheController_.clearDocumentResources();  // Don't need cache for cover
         needsRender_ = true;
       }
       handledAtStart = true;
@@ -877,7 +705,7 @@ void ReaderState::applyNavResult(const ReaderNavigation::NavResult& result, Core
   if (result.needsCacheReset) {
     auto resources = acquireForegroundResources("apply-nav-reset");
     if (resources) {
-      resourceController_.clearDocumentResources();
+      cacheController_.clearDocumentResources();
     }
   }
   startBackgroundCaching(core);  // Resume caching
@@ -926,7 +754,7 @@ void ReaderState::navigateNextChapter(Core& core) {
     }
     currentSpineIndex_++;
     currentSectionPage_ = 0;
-    resourceController_.clearDocumentResources();
+    cacheController_.clearDocumentResources();
   }
   needsRender_ = true;
   startBackgroundCaching(core);
@@ -990,13 +818,14 @@ void ReaderState::navigatePrevChapter(Core& core) {
       if (provider && provider->getEpub()) {
         spineCount = provider->getEpub()->getSpineItemsCount();
       }
-      int firstContentSpine = calcFirstContentSpine(hasCover_, textStartIndex_, spineCount);
+      int firstContentSpine =
+          reader::ReaderCacheController::calcFirstContentSpine(hasCover_, textStartIndex_, spineCount);
       if (currentSpineIndex_ <= firstContentSpine) {
         reachedStartOfBook = true;
       } else {
         currentSpineIndex_--;
         currentSectionPage_ = 0;
-        resourceController_.clearDocumentResources();
+        cacheController_.clearDocumentResources();
       }
     }
   }
@@ -1058,10 +887,10 @@ void ReaderState::renderCurrentPage(Core& core) {
   }
 
   bool shouldResumeCaching = false;
-  if (!cacheTask_.isRunning()) {
+  if (!asyncJobsController_.isWorkerRunning()) {
     auto resources = acquireForegroundResources("render-post-check");
     if (resources) {
-      shouldResumeCaching = !pageCache_ || !thumbnailDone_.load(std::memory_order_acquire);
+      shouldResumeCaching = !pageCache_ || !cacheController_.thumbnailDone();
     }
   }
 
@@ -1282,75 +1111,13 @@ bool ReaderState::ensurePageCached(Core& core, uint16_t pageNum) {
 }
 
 void ReaderState::loadCacheFromDisk(Core& core) {
-  const Theme& theme = THEME_MANAGER.current();
-  ContentType type = core.content.metadata().type;
-
   const auto vp = getReaderViewport();
-  const auto config = core.settings.getRenderConfig(theme, vp.width, vp.height);
-
-  std::string cachePath;
-  if (type == ContentType::Epub) {
-    auto* provider = core.content.asEpub();
-    if (!provider || !provider->getEpub()) {
-      LOG_ERR(TAG, "loadCacheFromDisk: no epub provider");
-      return;
-    }
-    cachePath = epubSectionCachePath(provider->getEpub()->getCachePath(), currentSpineIndex_);
-  } else if (type == ContentType::Txt) {
-    cachePath = contentCachePath(core.content.cacheDir(), config.fontId);
-  } else {
-    LOG_ERR(TAG, "loadCacheFromDisk: unsupported content type %d", static_cast<int>(type));
-    return;
-  }
-
-  // Caller must have stopped background task (we own pageCache_)
-  if (!pageCache_) {
-    pageCache_.reset(new (std::nothrow) PageCache(cachePath));
-    if (pageCache_ && !pageCache_->load(config)) {
-      pageCache_.reset();
-    }
-  }
+  cacheController_.loadCacheFromDisk(core, currentSpineIndex_, vp.width, vp.height);
 }
 
 void ReaderState::createOrExtendCache(Core& core) {
-  const Theme& theme = THEME_MANAGER.current();
-  ContentType type = core.content.metadata().type;
-
   const auto vp = getReaderViewport();
-  const auto config = core.settings.getRenderConfig(theme, vp.width, vp.height);
-
-  std::string cachePath;
-  if (type == ContentType::Epub) {
-    auto* provider = core.content.asEpub();
-    if (!provider || !provider->getEpub()) return;
-    auto epub = provider->getEpubShared();
-    cachePath = epubSectionCachePath(epub->getCachePath(), currentSpineIndex_);
-
-    // Create parser if we don't have one (or if spine changed)
-    if (!parser_ || parserSpineIndex_ != currentSpineIndex_) {
-      std::string imageCachePath = core.settings.showImages ? (epub->getCachePath() + "/images") : "";
-      parser_.reset(new (std::nothrow) EpubChapterParser(epub, currentSpineIndex_, renderer_, config, imageCachePath));
-      if (!parser_) {
-        LOG_ERR(TAG, "createOrExtendCache: OOM allocating EpubChapterParser");
-        return;
-      }
-      parserSpineIndex_ = currentSpineIndex_;
-    }
-  } else if (type == ContentType::Txt) {
-    cachePath = contentCachePath(core.content.cacheDir(), config.fontId);
-    if (!parser_) {
-      parser_.reset(new (std::nothrow) PlainTextParser(contentPath_, renderer_, config));
-      if (!parser_) {
-        LOG_ERR(TAG, "createOrExtendCache: OOM allocating PlainTextParser");
-        return;
-      }
-      parserSpineIndex_ = 0;
-    }
-  } else {
-    return;
-  }
-
-  createOrExtendCacheImpl(*parser_, cachePath, config);
+  cacheController_.createOrExtendCache(core, currentSpineIndex_, vp.width, vp.height);
 }
 
 void ReaderState::renderPageContents(Core& core, Page& page, int marginTop, int marginRight, int marginBottom,
@@ -1576,19 +1343,7 @@ std::string ReaderState::extractTextAnchor(const Page& page) const {
 
 std::string ReaderState::cachePathForPosition(Core& core, ContentType type, int spineIndex,
                                               const RenderConfig& config) const {
-  if (type == ContentType::Epub) {
-    auto* provider = core.content.asEpub();
-    if (!provider || !provider->getEpub()) {
-      return {};
-    }
-    return epubSectionCachePath(provider->getEpub()->getCachePath(), spineIndex);
-  }
-
-  if (type == ContentType::Txt) {
-    return contentCachePath(core.content.cacheDir(), config.fontId);
-  }
-
-  return {};
+  return cacheController_.cachePathForPosition(core, type, spineIndex, config);
 }
 
 int ReaderState::findPageForTextAnchor(PageCache& cache, const char* textAnchor, int pageHint) const {
@@ -1698,7 +1453,7 @@ void ReaderState::toggleReadingOrientation(Core& core) {
   {
     auto resources = acquireForegroundResources("toggle-orientation-reset");
     if (resources) {
-      resourceController_.clearDocumentResources();
+      cacheController_.clearDocumentResources();
     }
   }
   pagesUntilFullRefresh_ = 1;
@@ -1752,14 +1507,7 @@ void ReaderState::startBackgroundCaching(Core& core) {
     return;
   }
 
-  // BackgroundTask handles safe restart via CAS loop
-  if (cacheTask_.isRunning()) {
-    LOG_ERR(TAG, "Warning: Previous cache task still running, stopping first");
-    stopBackgroundCaching();
-  }
-
   LOG_INF(TAG, "Starting background page cache task");
-  coreForCacheTask_ = &core;
 
   // Snapshot state for the background task
   const int sectionPage = currentSectionPage_;
@@ -1767,109 +1515,38 @@ void ReaderState::startBackgroundCaching(Core& core) {
   const bool coverExists = hasCover_;
   const int textStart = textStartIndex_;
 
-  cacheTask_.start(
-      "PageCache", kCacheTaskStackSize,
-      [this, sectionPage, spineIndex, coverExists, textStart]() {
-        const Theme& theme = THEME_MANAGER.current();
-        LOG_INF(TAG, "Background cache task started");
+  asyncJobsController_.startWorkerJob("PageCache", [this, &core, sectionPage, spineIndex, coverExists,
+                                                    textStart](const reader::ReaderAsyncJobsController::AbortCallback& abort) {
+    LOG_INF(TAG, "Background cache task started");
 
-        if (cacheTask_.shouldStop()) {
-          LOG_DBG(TAG, "Background cache task aborted (stop requested)");
-          return;
-        }
+    auto resources = acquireWorkerResources("background-cache");
+    if (!resources) {
+      return;
+    }
 
-        Core* corePtr = coreForCacheTask_;
-        if (!corePtr) {
-          LOG_ERR(TAG, "Background cache task aborted (no core)");
-          return;
-        }
+    const auto vp = getReaderViewport();
+    cacheController_.runBackgroundCache(core, spineIndex, sectionPage, coverExists, textStart, vp.width, vp.height, abort);
 
-        Core& coreRef = *corePtr;
-        ContentType type = coreRef.content.metadata().type;
-        auto resources = acquireWorkerResources("background-cache");
-        if (!resources) {
-          return;
-        }
+    // Generate thumbnail from cover for HomeState (lower priority than page cache)
+    // Only attempt once per book open — skip if already tried (success or failure)
+    if (!cacheController_.thumbnailDone() && !(abort && abort())) {
+      core.content.generateThumbnail();
+      thumbnailDone_.store(true, std::memory_order_release);
+    }
 
-        // Build cache if it doesn't exist
-        if (!pageCache_ && !cacheTask_.shouldStop()) {
-          const auto vp = getReaderViewport();
-          const auto config = coreRef.settings.getRenderConfig(theme, vp.width, vp.height);
-          std::string cachePath;
-
-          if (type == ContentType::Epub) {
-            auto* provider = coreRef.content.asEpub();
-            if (provider && provider->getEpub() && !cacheTask_.shouldStop()) {
-              const auto* epub = provider->getEpub();
-              std::string imageCachePath = coreRef.settings.showImages ? (epub->getCachePath() + "/images") : "";
-              // When on cover page (sectionPage=-1), cache the first content spine
-              int spineToCache = spineIndex;
-              if (sectionPage == -1) {
-                spineToCache = calcFirstContentSpine(coverExists, textStart, epub->getSpineItemsCount());
-              }
-              cachePath = epubSectionCachePath(epub->getCachePath(), spineToCache);
-
-              if (!parser_ || parserSpineIndex_ != spineToCache) {
-                parser_.reset(new (std::nothrow)
-                                  EpubChapterParser(provider->getEpubShared(), spineToCache, renderer_, config, imageCachePath));
-                if (!parser_) {
-                  LOG_ERR(TAG, "startBackgroundCaching: OOM allocating EpubChapterParser");
-                  return;
-                }
-                parserSpineIndex_ = spineToCache;
-              }
-            }
-          } else if (type == ContentType::Txt && !cacheTask_.shouldStop()) {
-            cachePath = contentCachePath(coreRef.content.cacheDir(), config.fontId);
-            if (!parser_) {
-              parser_.reset(new (std::nothrow) PlainTextParser(contentPath_, renderer_, config));
-              if (!parser_) {
-                LOG_ERR(TAG, "startBackgroundCaching: OOM allocating PlainTextParser");
-                return;
-              }
-              parserSpineIndex_ = 0;
-            }
-          }
-
-          if (parser_ && !cachePath.empty() && !cacheTask_.shouldStop()) {
-            backgroundCacheImpl(*parser_, cachePath, config);
-          }
-        }
-
-        // Generate thumbnail from cover for HomeState (lower priority than page cache)
-        // Only attempt once per book open — skip if already tried (success or failure)
-        if (!thumbnailDone_.load(std::memory_order_acquire) && !cacheTask_.shouldStop()) {
-          coreRef.content.generateThumbnail();
-          thumbnailDone_.store(true, std::memory_order_release);
-        }
-
-        if (!cacheTask_.shouldStop()) {
-          LOG_INF(TAG, "Background cache task completed");
-        } else {
-          LOG_DBG(TAG, "Background cache task stopped");
-        }
-      },
-      0);  // priority 0 (idle)
+    if (!(abort && abort())) {
+      LOG_INF(TAG, "Background cache task completed");
+    } else {
+      LOG_DBG(TAG, "Background cache task stopped");
+    }
+  }, 0);
 }
 
 void ReaderState::stopBackgroundCaching() {
-  if (!cacheTask_.isRunning()) {
+  if (!asyncJobsController_.isWorkerRunning()) {
     return;
   }
-
-  // BackgroundTask::stop() uses event-based waiting (no polling)
-  // and NEVER force-deletes the task
-  if (!cacheTask_.stop(kCacheTaskStopTimeoutMs)) {
-    LOG_ERR(TAG, "Cache task did not stop within timeout");
-    LOG_ERR(TAG, "Task may be blocked on SD card I/O");
-  }
-
-  // Yield to allow FreeRTOS idle task to clean up the deleted task's TCB.
-  // The background task self-deletes via vTaskDelete(NULL), but the idle task
-  // must run to free its resources. Without this, parser_.reset() or
-  // pageCache_.reset() can trigger mutex ownership violations
-  // (assert failed: xQueueGenericSend queue.c:832).
-  vTaskDelay(10 / portTICK_PERIOD_MS);
+  asyncJobsController_.stopWorker();
 }
 
 // ============================================================================
@@ -1990,7 +1667,7 @@ int ReaderState::findCurrentTocEntry(Core& core) {
 
     // Load anchor map once from disk (avoids reopening file per TOC entry)
     std::string cachePath = epubSectionCachePath(epub->getCachePath(), currentSpineIndex_);
-    auto anchors = loadAnchorMap(cachePath);
+    auto anchors = reader::ReaderCacheController::loadAnchorMap(cachePath);
 
     // Refine: find the latest TOC entry whose anchor page <= current page
     const int tocCount = epub->getTocItemsCount();
@@ -2070,7 +1747,7 @@ void ReaderState::jumpToTocEntry(Core& core, int tocIndex) {
     const auto jumpPlan = reader::planEpubTocJump(currentSpineIndex_, chapter.pageNum);
     if (jumpPlan.needsResourceReset) {
       // Task already stopped by enterTocMode(); caller restarts after exitTocMode()
-      resourceController_.clearDocumentResources();
+      cacheController_.clearDocumentResources();
     }
     currentSpineIndex_ = jumpPlan.spineIndex;
     currentSectionPage_ = jumpPlan.sectionPage;
@@ -2079,7 +1756,7 @@ void ReaderState::jumpToTocEntry(Core& core, int tocIndex) {
     auto tocItem = epub->getTocItem(tocIndex);
     if (!tocItem.anchor.empty()) {
       std::string cachePath = epubSectionCachePath(epub->getCachePath(), chapter.pageNum);
-      int page = loadAnchorPage(cachePath, tocItem.anchor);
+      int page = reader::ReaderCacheController::loadAnchorPage(cachePath, tocItem.anchor);
 
       // Anchor not resolved — build cache until found or chapter fully parsed
       if (page < 0) {
@@ -2089,13 +1766,13 @@ void ReaderState::jumpToTocEntry(Core& core, int tocIndex) {
         renderer_.displayBuffer();
 
         createOrExtendCache(core);
-        page = loadAnchorPage(cachePath, tocItem.anchor);
+        page = reader::ReaderCacheController::loadAnchorPage(cachePath, tocItem.anchor);
 
         while (page < 0 && pageCache_ && pageCache_->isPartial()) {
           const size_t pagesBefore = pageCache_->pageCount();
           createOrExtendCache(core);
           if (!pageCache_ || pageCache_->pageCount() <= pagesBefore) break;
-          page = loadAnchorPage(cachePath, tocItem.anchor);
+          page = reader::ReaderCacheController::loadAnchorPage(cachePath, tocItem.anchor);
         }
       }
 
