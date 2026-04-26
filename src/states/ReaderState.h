@@ -129,6 +129,7 @@ class ReaderState : public State {
   void renderCachedPage(Core& core);
   void renderXtcPage(Core& core);
   bool renderCoverPage(Core& core);
+  void prefetchAdjacentPage(Core& core);
 
   // Helpers
   void renderPageContents(Core& core, Page& page, int marginTop, int marginRight, int marginBottom, int marginLeft);
@@ -166,6 +167,7 @@ class ReaderState : public State {
 
   // Source state (where reader was opened from)
   StateId sourceState_ = StateId::Home;
+  bool directUiTransition_ = false;
 
   // TOC overlay mode
   bool tocMode_ = false;
@@ -181,7 +183,7 @@ class ReaderState : public State {
   void jumpToTocEntry(Core& core, int tocIndex);
 
   // Boot mode transition - exit to UI via restart
-  void exitToUI(Core& core);
+  StateTransition exitToUI(Core& core);
   void exitToFileList(Core& core);
 };
 

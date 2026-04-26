@@ -8,6 +8,8 @@
 #include <SDCardManager.h>
 #include <Serialization.h>
 
+#include <algorithm>
+
 #include "ContentParser.h"
 #include "PageCacheHeader.h"
 
@@ -44,10 +46,115 @@ void PageCache::resetState() {
   if (file_) {
     file_.close();
   }
+  closeReadHandle();
   pageCount_ = 0;
   isPartial_ = false;
   config_ = RenderConfig{};
   lutOffset_ = 0;
+  pageLut_.clear();
+  clearResidentPages();
+}
+
+bool PageCache::ensureReadHandle() {
+  if (readFile_) {
+    return true;
+  }
+
+  if (SdMan.openFileForRead("CACHE", cachePath_, readFile_)) {
+    readFileSize_ = readFile_.size();
+    return true;
+  }
+
+  // If this object already loaded a cache header, a transient SdFat miss is
+  // possible right after another operation touched the directory cache.
+  if (pageCount_ == 0) {
+    return false;
+  }
+
+  for (int attempt = 1; attempt < 3; attempt++) {
+    delay(10);
+    if (SdMan.openFileForRead("CACHE", cachePath_, readFile_)) {
+      readFileSize_ = readFile_.size();
+      return true;
+    }
+  }
+  return false;
+}
+
+void PageCache::closeReadHandle() {
+  if (readFile_) {
+    readFile_.close();
+  }
+  readFileSize_ = 0;
+}
+
+std::shared_ptr<Page> PageCache::getResidentPage(const uint16_t pageNum) {
+  for (auto& entry : residentPages_) {
+    if (entry.pageNum == pageNum && entry.page) {
+      entry.useToken = ++residentUseClock_;
+      return entry.page;
+    }
+  }
+  return nullptr;
+}
+
+void PageCache::putResidentPage(const uint16_t pageNum, std::shared_ptr<Page> page) {
+  if (!page) {
+    return;
+  }
+
+  for (auto& entry : residentPages_) {
+    if (entry.pageNum == pageNum) {
+      entry.page = std::move(page);
+      entry.useToken = ++residentUseClock_;
+      return;
+    }
+  }
+
+  if (residentPages_.size() >= RESIDENT_PAGE_LIMIT) {
+    auto lruIt = residentPages_.begin();
+    for (auto it = residentPages_.begin() + 1; it != residentPages_.end(); ++it) {
+      if (it->useToken < lruIt->useToken) {
+        lruIt = it;
+      }
+    }
+    *lruIt = ResidentPage{pageNum, ++residentUseClock_, std::move(page)};
+    return;
+  }
+
+  residentPages_.push_back(ResidentPage{pageNum, ++residentUseClock_, std::move(page)});
+}
+
+bool PageCache::ensureLutLoaded() {
+  if (!pageLut_.empty()) {
+    return true;
+  }
+  std::vector<uint32_t> lut;
+  return loadLut(lut);
+}
+
+void PageCache::clearResidentPages() {
+  residentPages_.clear();
+  residentUseClock_ = 0;
+}
+
+void PageCache::trimResidentPages(const uint16_t centerPage, const uint8_t keepBehind, const uint8_t keepAhead) {
+  if (residentPages_.empty()) {
+    return;
+  }
+
+  const int minPage = std::max(0, static_cast<int>(centerPage) - static_cast<int>(keepBehind));
+  const int maxPage = static_cast<int>(centerPage) + static_cast<int>(keepAhead);
+
+  residentPages_.erase(std::remove_if(residentPages_.begin(), residentPages_.end(),
+                                      [minPage, maxPage](const ResidentPage& entry) {
+                                        return !entry.page || static_cast<int>(entry.pageNum) < minPage ||
+                                               static_cast<int>(entry.pageNum) > maxPage;
+                                      }),
+                       residentPages_.end());
+  if (residentPages_.empty()) {
+    residentUseClock_ = 0;
+  }
 }
 
 bool PageCache::writeHeader(bool isPartial) {
@@ -86,6 +193,8 @@ bool PageCache::writeLut(const std::vector<uint32_t>& lut) {
   serialization::writePod(file_, static_cast<uint8_t>(isPartial_ ? 1 : 0));
   serialization::writePod(file_, lutOffset);
   lutOffset_ = lutOffset;
+  pageLut_ = lut;
+  closeReadHandle();
 
   return true;
 }
@@ -146,6 +255,7 @@ bool PageCache::loadLut(std::vector<uint32_t>& lut) {
 
   file_.close();
   lut = std::move(loadedLut);
+  pageLut_ = lut;
   pageCount_ = header.pageCount;
   lutOffset_ = header.lutOffset;
   return true;
@@ -182,6 +292,8 @@ bool PageCache::loadRaw() {
   pageCount_ = header.pageCount;
   isPartial_ = header.isPartial;
   lutOffset_ = header.lutOffset;
+  pageLut_.clear();
+  clearResidentPages();
   return true;
 }
 
@@ -223,6 +335,8 @@ bool PageCache::load(const RenderConfig& config) {
   isPartial_ = header.isPartial;
   config_ = config;
   lutOffset_ = header.lutOffset;
+  pageLut_.clear();
+  clearResidentPages();
   LOG_INF(TAG, "Loaded: %d pages, partial=%d", pageCount_, isPartial_);
   return true;
 }
@@ -250,6 +364,9 @@ bool PageCache::create(ContentParser& parser, const RenderConfig& config, uint16
     }
     file_.seekEnd();  // Append after old LUT
   } else {
+    closeReadHandle();
+    pageLut_.clear();
+    clearResidentPages();
     // Fresh create
     if (!SdMan.openFileForWrite("CACHE", cachePath_, file_)) {
       LOG_ERR(TAG, "Failed to open cache file for writing");
@@ -408,6 +525,7 @@ bool PageCache::extend(ContentParser& parser, uint16_t additionalPages, const Ab
     std::vector<uint32_t> lut;
     if (!loadLut(lut)) return false;
 
+    closeReadHandle();
     bool opened = false;
     for (int attempt = 0; attempt < 3; attempt++) {
       if (attempt > 0) delay(50);
@@ -473,77 +591,118 @@ bool PageCache::extend(ContentParser& parser, uint16_t additionalPages, const Ab
   return result;
 }
 
-std::unique_ptr<Page> PageCache::loadPage(uint16_t pageNum) {
+std::shared_ptr<Page> PageCache::loadPage(uint16_t pageNum) {
   if (pageNum >= pageCount_) {
     LOG_ERR(TAG, "Page %d out of range (max %d)", pageNum, pageCount_);
+    return nullptr;
+  }
+
+  if (auto resident = getResidentPage(pageNum)) {
+    return resident;
+  }
+
+  if (!ensureLutLoaded()) {
+    return nullptr;
+  }
+
+  if (pageNum >= pageLut_.size()) {
+    LOG_ERR(TAG, "Page LUT missing entry %d (size %zu)", pageNum, pageLut_.size());
     return nullptr;
   }
 
   for (int attempt = 0; attempt < 3; attempt++) {
     if (attempt > 0) delay(50);
 
-    if (!SdMan.openFileForRead("CACHE", cachePath_, file_)) {
+    if (!ensureReadHandle()) {
       continue;
     }
 
-    const size_t fileSize = file_.size();
-
-    // Read pageCount from header to validate LUT bounds against on-disk state.
-    pagecache::HeaderInfo header;
-    const auto status = pagecache::readHeader(file_, header, false);
-    if (status == pagecache::HeaderReadStatus::VersionMismatch) {
-      file_.close();
-      clear();
-      return nullptr;
-    }
-    if (status != pagecache::HeaderReadStatus::Ok) {
-      file_.close();
-      evictCacheFile(cachePath_, "load-page-read-header-failed");
-      resetState();
-      return nullptr;
-    }
-
-    if (!pagecache::validateIndexBounds(cachePath_.c_str(), fileSize, header.pageCount, header.lutOffset)) {
-      file_.close();
-      clear();
-      return nullptr;
-    }
-
-    if (pageNum >= header.pageCount) {
-      LOG_ERR(TAG, "Page %d out of range in on-disk cache (max %d)", pageNum, header.pageCount);
-      file_.close();
-      pageCount_ = header.pageCount;
-      return nullptr;
-    }
-
-    // Read page position from LUT
-    file_.seek(header.lutOffset + static_cast<size_t>(pageNum) * sizeof(uint32_t));
-    uint32_t pagePos;
-    if (!serialization::readPodChecked(file_, pagePos)) {
-      file_.close();
-      evictCacheFile(cachePath_, "load-page-read-entry-failed");
-      resetState();
-      return nullptr;
-    }
-
     // Validate page position
-    if (pagePos < pagecache::kHeaderSize || pagePos >= header.lutOffset || pagePos >= fileSize) {
+    const size_t fileSize = readFileSize_;
+    const uint32_t pagePos = pageLut_[pageNum];
+    if (pagePos < pagecache::kHeaderSize || pagePos >= lutOffset_ || pagePos >= fileSize) {
       LOG_ERR(TAG, "Invalid page position: %u (lutOffset=%u file size=%zu)", pagePos,
-              static_cast<unsigned>(header.lutOffset), fileSize);
-      file_.close();
-      clear();
-      return nullptr;
+              static_cast<unsigned>(lutOffset_), fileSize);
+      closeReadHandle();
+      continue;
     }
 
     // Read page
-    file_.seek(pagePos);
-    auto page = Page::deserialize(file_);
-    file_.close();
+    readFile_.seek(pagePos);
+    auto page = Page::deserialize(readFile_);
 
-    if (page) return page;
+    if (page) {
+      auto sharedPage = std::shared_ptr<Page>(std::move(page));
+      putResidentPage(pageNum, sharedPage);
+      return sharedPage;
+    }
   }
 
   return nullptr;
+}
+
+void PageCache::prefetchWindow(uint16_t centerPage, int direction, uint8_t span) {
+  if (pageCount_ == 0 || !ensureLutLoaded()) {
+    return;
+  }
+  if (span == 0) {
+    trimResidentPages(centerPage, 0, 0);
+    return;
+  }
+
+  std::vector<uint16_t> wanted;
+  wanted.reserve(span + 1);
+
+  const uint8_t forwardBias = direction >= 0 ? span : 1;
+  const uint8_t backwardBias = direction >= 0 ? 1 : span;
+
+  trimResidentPages(centerPage, backwardBias, forwardBias);
+
+  for (uint8_t delta = 1; delta <= forwardBias; ++delta) {
+    const int page = static_cast<int>(centerPage) + delta;
+    if (page >= 0 && page < pageCount_) {
+      wanted.push_back(static_cast<uint16_t>(page));
+    }
+  }
+  for (uint8_t delta = 1; delta <= backwardBias; ++delta) {
+    const int page = static_cast<int>(centerPage) - delta;
+    if (page >= 0 && page < pageCount_) {
+      wanted.push_back(static_cast<uint16_t>(page));
+    }
+  }
+
+  bool hasMiss = false;
+  for (uint16_t pageNum : wanted) {
+    if (!getResidentPage(pageNum)) {
+      hasMiss = true;
+      break;
+    }
+  }
+  if (!hasMiss) {
+    return;
+  }
+
+  if (!ensureReadHandle()) {
+    return;
+  }
+
+  const size_t fileSize = readFileSize_;
+  for (uint16_t pageNum : wanted) {
+    if (getResidentPage(pageNum) || pageNum >= pageLut_.size()) {
+      continue;
+    }
+
+    const uint32_t pagePos = pageLut_[pageNum];
+    if (pagePos < pagecache::kHeaderSize || pagePos >= lutOffset_ || pagePos >= fileSize) {
+      continue;
+    }
+
+    readFile_.seek(pagePos);
+    auto page = Page::deserialize(readFile_);
+    if (page) {
+      putResidentPage(pageNum, std::shared_ptr<Page>(std::move(page)));
+    }
+  }
 }
 
 bool PageCache::clear() {

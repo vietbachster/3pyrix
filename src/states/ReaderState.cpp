@@ -200,6 +200,8 @@ void ReaderState::enter(Core& core) {
   powerPressStartedMs_ = 0;
   autoPageTurnTargetMs_ = 0;
   lastPageWordCount_ = 0;
+  directUiTransition_ = core.pendingDirectReaderTransition;
+  core.pendingDirectReaderTransition = false;
   stopBackgroundCaching();  // Ensure any previous task is stopped
   {
     auto resources = acquireForegroundResources("enter-reset-session");
@@ -220,8 +222,12 @@ void ReaderState::enter(Core& core) {
 
   // Determine source state from boot transition
   const auto& transition = getTransition();
-  sourceState_ =
-      (transition.isValid() && transition.returnTo == ReturnTo::FILE_MANAGER) ? StateId::FileList : StateId::Home;
+  if (directUiTransition_) {
+    sourceState_ = core.pendingReaderReturnState;
+  } else {
+    sourceState_ =
+        (transition.isValid() && transition.returnTo == ReturnTo::FILE_MANAGER) ? StateId::FileList : StateId::Home;
+  }
 
   LOG_INF(TAG, "Entering with path: %s", contentPath_);
 
@@ -380,6 +386,7 @@ void ReaderState::exit(Core& core) {
   contentLoaded_ = false;
   contentPath_[0] = '\0';
   framePreservedOnWake_ = false;
+  directUiTransition_ = false;
   pendingProgress_.reset();
   pendingProgressRestore_ = false;
 
@@ -428,9 +435,7 @@ StateTransition ReaderState::update(Core& core) {
             if (confirmClickPending_) {
               commitPendingConfirmClick(core);
             }
-            exitToUI(core);
-            // Won't reach here after restart
-            return StateTransition::stay(StateId::Reader);
+            return exitToUI(core);
           case Button::Power:
             if (core.settings.shortPwrBtn == Settings::PowerPageTurn) {
               powerPressStartedMs_ = millis();
@@ -890,7 +895,7 @@ void ReaderState::renderCurrentPage(Core& core) {
   if (!asyncJobsController_.isWorkerRunning()) {
     auto resources = acquireForegroundResources("render-post-check");
     if (resources) {
-      shouldResumeCaching = !pageCache_ || !cacheController_.thumbnailDone();
+      shouldResumeCaching = !pageCache_ || pageCache_->isPartial() || !cacheController_.thumbnailDone();
     }
   }
 
@@ -1069,8 +1074,39 @@ void ReaderState::renderCachedPage(Core& core) {
   // Always track word count for immediate scheduling on user activation
   lastPageWordCount_ = countPageWords(*page);
   scheduleAutoPageTurn(core, lastPageWordCount_);
+  prefetchAdjacentPage(core);
 
   LOG_DBG(TAG, "Rendered page %d/%d", currentSectionPage_ + 1, pageCount);
+}
+
+void ReaderState::prefetchAdjacentPage(Core& core) {
+  if (!pageCache_ || currentSectionPage_ < 0) {
+    return;
+  }
+
+  const int pageCount = static_cast<int>(pageCache_->pageCount());
+  if (pageCount <= 1) {
+    return;
+  }
+
+  int direction = 1;
+  if (lastRenderedSpineIndex_ == currentSpineIndex_ && lastRenderedSectionPage_ > currentSectionPage_) {
+    direction = -1;
+  }
+
+  const int nextPage = currentSectionPage_ + direction;
+  if (nextPage < 0 || nextPage >= pageCount) {
+    return;
+  }
+
+  pageCache_->prefetchWindow(static_cast<uint16_t>(currentSectionPage_), direction, 2);
+
+  const Theme& theme = THEME_MANAGER.current();
+  const int fontId = core.settings.getReaderFontId(theme);
+  auto warmedPage = pageCache_->loadPage(static_cast<uint16_t>(nextPage));
+  if (warmedPage) {
+    warmedPage->warmGlyphs(renderer_, fontId);
+  }
 }
 
 bool ReaderState::ensurePageCached(Core& core, uint16_t pageNum) {
@@ -1214,7 +1250,7 @@ ProgressManager::Progress ReaderState::buildProgressSnapshot(Core& core) const {
     return progress;
   }
 
-  std::unique_ptr<Page> page;
+  std::shared_ptr<Page> page;
   if (pageCache_) {
     page = pageCache_->loadPage(static_cast<uint16_t>(progress.sectionPage));
   }
@@ -1832,7 +1868,14 @@ void ReaderState::renderTocOverlay(Core& core) {
   core.display.markDirty();
 }
 
-void ReaderState::exitToUI(Core& core) {
+StateTransition ReaderState::exitToUI(Core& core) {
+  if (directUiTransition_) {
+    LOG_INF(TAG, "Exiting to UI via direct state transition");
+    core.pendingUiReturnFromReader = true;
+    core.pendingReaderReturnState = sourceState_;
+    return StateTransition::to(sourceState_);
+  }
+
   LOG_INF(TAG, "Exiting to UI mode via restart");
 
   // Stop background caching first - BackgroundTask::stop() waits properly
@@ -1862,6 +1905,7 @@ void ReaderState::exitToUI(Core& core) {
   // Brief delay to ensure SD writes complete before restart
   vTaskDelay(50 / portTICK_PERIOD_MS);
   ESP.restart();
+  return StateTransition::stay(StateId::Reader);
 }
 
 void ReaderState::exitToFileList(Core& core) {

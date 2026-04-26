@@ -128,10 +128,13 @@ StateTransition HomeState::update(Core& core) {
           case Button::Back:
             // btn1: Read - Continue reading if book is open
             if (view_.buttons.isActive(0) && view_.hasBook) {
-              showTransitionNotification("Opening book...");
-              saveTransition(BootMode::READER, core.buf.path, ReturnTo::HOME);
-              vTaskDelay(50 / portTICK_PERIOD_MS);
-              ESP.restart();
+              if (core.buf.path[0] == '\0' && core.settings.lastBookPath[0] != '\0') {
+                strncpy(core.buf.path, core.settings.lastBookPath, sizeof(core.buf.path) - 1);
+                core.buf.path[sizeof(core.buf.path) - 1] = '\0';
+              }
+              core.pendingDirectReaderTransition = true;
+              core.pendingReaderReturnState = StateId::Home;
+              return StateTransition::to(StateId::Reader);
             }
             break;
 

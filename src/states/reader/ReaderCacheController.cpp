@@ -307,10 +307,6 @@ void ReaderCacheController::runBackgroundCache(Core& core, const int currentSpin
                                                const bool hasCover, const int textStartIndex,
                                                const uint16_t viewportWidth, const uint16_t viewportHeight,
                                                const AbortCallback& shouldAbort) {
-  if (pageCacheRef()) {
-    return;
-  }
-
   const Theme& theme = THEME_MANAGER.current();
   const ContentType type = core.content.metadata().type;
   const RenderConfig config = core.settings.getRenderConfig(theme, viewportWidth, viewportHeight);
@@ -354,6 +350,39 @@ void ReaderCacheController::runBackgroundCache(Core& core, const int currentSpin
 
   if (parser && !cachePath.empty() && !(shouldAbort && shouldAbort())) {
     backgroundCacheImpl(*parser, cachePath, config, currentSectionPage, shouldAbort);
+  }
+
+  if (type == ContentType::Epub && !(shouldAbort && shouldAbort())) {
+    auto* provider = core.content.asEpub();
+    if (!provider || !provider->getEpub()) {
+      return;
+    }
+
+    auto epub = provider->getEpubShared();
+    const int spineCount = epub->getSpineItemsCount();
+    int activeSpine = currentSpineIndex;
+    if (currentSectionPage == -1) {
+      activeSpine = calcFirstContentSpine(hasCover, textStartIndex, spineCount);
+    }
+
+    const int nextSpine = activeSpine + 1;
+    if (nextSpine < 0 || nextSpine >= spineCount) {
+      return;
+    }
+
+    const std::string nextCachePath = epubSectionCachePath(epub->getCachePath(), nextSpine);
+    PageCache nextCache(nextCachePath);
+    if (nextCache.load(config)) {
+      return;
+    }
+
+    const std::string imageCachePath = core.settings.showImages ? (epub->getCachePath() + "/images") : "";
+    EpubChapterParser nextParser(epub, nextSpine, renderer_, config, imageCachePath);
+    if (nextCache.create(nextParser, config, PageCache::DEFAULT_CACHE_CHUNK, 0, shouldAbort) &&
+        !(shouldAbort && shouldAbort())) {
+      saveAnchorMap(nextParser, nextCachePath);
+      LOG_INF(TAG, "Prefetched next EPUB spine %d", nextSpine);
+    }
   }
 }
 

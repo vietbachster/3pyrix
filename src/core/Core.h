@@ -42,6 +42,9 @@ struct Core {
   // === Pending operations ===
   SyncMode pendingSync = SyncMode::None;
   StateId networkReturnState = StateId::Home;
+  bool pendingDirectReaderTransition = false;
+  StateId pendingReaderReturnState = StateId::Home;
+  bool pendingUiReturnFromReader = false;
   bool preserveReaderPageOnSleep = false;
 
   // === Lifecycle ===
