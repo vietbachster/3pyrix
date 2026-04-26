@@ -339,9 +339,9 @@ void ReaderState::enter(Core& core) {
 
   LOG_INF(TAG, "Loaded: %s", core.content.metadata().title);
 
-  // Start background caching (includes thumbnail generation)
-  // This runs once per book open regardless of starting position
-  startBackgroundCaching(core);
+  // Background caching starts after the first foreground render. The initial
+  // cover/page render shares the SD/SPI bus with display refresh, so keep it
+  // uncontended until the first frame is fully pushed to the panel.
 }
 
 void ReaderState::exit(Core& core) {
@@ -857,6 +857,7 @@ void ReaderState::renderCurrentPage(Core& core) {
     if (core.settings.showImages) {
       if (renderCoverPage(core)) {
         hasCover_ = true;
+        startBackgroundCaching(core);
         core.display.markDirty();
         return;
       }
