@@ -1,6 +1,7 @@
 #include "ExternalFont.h"
 
 #include <Logging.h>
+#include <SharedSpiLock.h>
 
 #define TAG "EXT_FONT"
 
@@ -12,6 +13,7 @@ ExternalFont::~ExternalFont() { unload(); }
 
 void ExternalFont::unload() {
   if (_fontFile) {
+    papyrix::spi::SharedBusLock busLock;
     _fontFile.close();
   }
   _isLoaded = false;
@@ -135,9 +137,14 @@ bool ExternalFont::load(const char* filepath) {
 
   // Validate file size
   static constexpr uint32_t MAX_FONT_FILE_SIZE = 32 * 1024 * 1024;  // 32MB max
-  uint32_t fileSize = _fontFile.size();
+  uint32_t fileSize = 0;
+  {
+    papyrix::spi::SharedBusLock busLock;
+    fileSize = _fontFile.size();
+  }
   if (fileSize == 0 || fileSize > MAX_FONT_FILE_SIZE) {
     LOG_ERR(TAG, "Invalid file size: %u bytes (max 32MB). Using default font.", fileSize);
+    papyrix::spi::SharedBusLock busLock;
     _fontFile.close();
     return false;
   }
@@ -190,6 +197,7 @@ bool ExternalFont::readGlyphFromSD(uint32_t codepoint, uint8_t* buffer) {
     return false;
   }
 
+  papyrix::spi::SharedBusLock busLock;
   // Calculate offset
   uint32_t offset = codepoint * _bytesPerChar;
 

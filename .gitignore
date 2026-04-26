@@ -40,10 +40,11 @@
 # debug information files
 *.dwo
 __pycache__
-test/
 tools/
 .pio/
 .DS_Store
 crosspoint
 papyrix
+test/snapix/
+test/build/
 test
